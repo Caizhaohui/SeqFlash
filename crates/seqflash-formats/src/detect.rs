@@ -11,8 +11,7 @@ const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// Number of bytes sampled from the head of the file for detection. The header
 /// alone is enough to tell FASTA from FASTQ; we never need the whole file here.
-#[allow(dead_code)] // used in upcoming M3 commit 4
-pub(crate) const DETECT_SAMPLE_BYTES: usize = 64 * 1024;
+pub const DETECT_SAMPLE_BYTES: usize = 64 * 1024;
 
 /// Preliminarily detect the sequence format of `bytes` (usually a head sample).
 ///
