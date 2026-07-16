@@ -2754,6 +2754,7 @@ dependencies = [
  "seqflash-document",
  "seqflash-settings",
  "seqflash-types",
+ "seqflash-viewer",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -2830,7 +2831,10 @@ version = "0.1.0"
 name = "seqflash-viewer"
 version = "0.1.0"
 dependencies = [
+ "eframe",
+ "seqflash-document",
  "seqflash-types",
+ "tempfile",
 ]
 
 [[package]]

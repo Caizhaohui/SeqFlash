@@ -26,4 +26,5 @@ directories = { workspace = true }
 rfd = { workspace = true }
 seqflash-document = { workspace = true }
 seqflash-types = { workspace = true }
+seqflash-viewer = { workspace = true }
 seqflash-settings = { workspace = true }

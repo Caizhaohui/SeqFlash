@@ -27,8 +27,9 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
     });
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        if let Some(doc) = app.active_document() {
-            preview(doc, ui);
+        let active_id = app.active_document_id();
+        if let (Some(doc_id), Some(doc)) = (active_id, app.active_document()) {
+            preview(doc_id, doc, ui);
         } else {
             empty_state(ui);
         }
@@ -88,58 +89,20 @@ fn tab_strip(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Central area when a document is open: a short, bounded byte preview.
-fn preview(doc: &Document, ui: &mut egui::Ui) {
-    // Show at most the first 4 KiB as lossy text; everything is bytes, never
-    // assumed to be valid UTF-8.
-    const PREVIEW_BYTES: usize = 4 * 1024;
+/// Central area when a document is open: the virtual-scrolling byte viewer.
+///
+/// Only the visible rows are formatted and drawn (`show_viewport`); the whole
+/// file is never handed to a widget or scanned during rendering (plan 9.5).
+fn preview(doc_id: DocumentId, doc: &Document, ui: &mut egui::Ui) {
+    use seqflash_viewer::ByteViewer;
 
-    ui.heading("Raw byte preview");
-    ui.label(
-        egui::RichText::new("(full virtual-scrolling viewer arrives in M2)")
-            .weak()
-            .small(),
-    );
-    ui.add_space(6.0);
+    ui.heading("Raw byte view");
+    ui.add_space(4.0);
 
-    let bytes = doc.bytes();
-    if bytes.is_empty() {
-        ui.label(
-            egui::RichText::new("This file is empty (0 bytes).")
-                .color(egui::Color32::from_rgb(0xC4, 0xA0, 0x00)),
-        );
-        return;
-    }
-
-    // Show at most the first 4 KiB as lossy text; everything is bytes, never
-    // assumed to be valid UTF-8.
-    let end = bytes.len().min(PREVIEW_BYTES);
-    let mut snippet: String = String::from_utf8_lossy(&bytes[..end]).into_owned();
-
-    egui::ScrollArea::vertical()
-        .id_salt("byte_preview")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            // `interactable(false)` makes the field read-only; egui still needs
-            // a `&mut` buffer to satisfy the TextEdit signature.
-            ui.add(
-                egui::TextEdit::multiline(&mut snippet)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::MAX)
-                    .interactive(false),
-            );
-        });
-
-    if bytes.len() > PREVIEW_BYTES {
-        ui.label(
-            egui::RichText::new(format!(
-                "… showing first {PREVIEW_BYTES} of {} bytes",
-                bytes.len()
-            ))
-            .weak()
-            .small(),
-        );
-    }
+    // One ByteViewer per central panel; it is cheap (just a width config) and
+    // stateless — scroll position is persisted by egui keyed on `id_salt`.
+    let viewer = ByteViewer::new();
+    viewer.show(ui, ("byte_view", doc_id.get()), doc.bytes());
 }
 
 /// Central area when no document is open.

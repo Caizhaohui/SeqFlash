@@ -86,6 +86,11 @@ impl SeqFlashApp {
         self.notice.as_deref()
     }
 
+    /// The active document id, if any.
+    pub(crate) fn active_document_id(&self) -> Option<DocumentId> {
+        self.active_document
+    }
+
     /// The active document, if any.
     pub(crate) fn active_document(&self) -> Option<&Document> {
         self.active_document.and_then(|id| self.documents.get(id))
