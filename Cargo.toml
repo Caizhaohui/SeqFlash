@@ -1,0 +1,84 @@
+# SeqFlash workspace manifest.
+#
+# See DEVELOPMENT_PLAN.md for the full architecture and milestone plan.
+# The crate split mirrors the layering in plan section 7.1 / 8.
+
+[workspace]
+resolver = "2"
+members = [
+    "apps/seqflash-app",
+    "crates/seqflash-types",
+    "crates/seqflash-settings",
+    "crates/seqflash-document",
+    "crates/seqflash-formats",
+    "crates/seqflash-index",
+    "crates/seqflash-viewer",
+    "crates/seqflash-search",
+    "crates/seqflash-ops",
+    "crates/seqflash-jobs",
+    "crates/seqflash-platform-windows",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = ""
+publish = false
+
+# Shared dependencies — referenced from member crates as `foo.workspace = true`.
+# Versions are pinned here so they stay in sync across the workspace.
+[workspace.dependencies]
+# GUI
+eframe = "0.32"
+egui = "0.32"
+
+# Logging / errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2"
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Platform helpers
+directories = "6"
+
+# Internal crates.
+seqflash-types = { path = "crates/seqflash-types" }
+seqflash-settings = { path = "crates/seqflash-settings" }
+seqflash-document = { path = "crates/seqflash-document" }
+seqflash-formats = { path = "crates/seqflash-formats" }
+seqflash-index = { path = "crates/seqflash-index" }
+seqflash-viewer = { path = "crates/seqflash-viewer" }
+seqflash-search = { path = "crates/seqflash-search" }
+seqflash-ops = { path = "crates/seqflash-ops" }
+seqflash-jobs = { path = "crates/seqflash-jobs" }
+seqflash-platform-windows = { path = "crates/seqflash-platform-windows" }
+
+# Strict but stable lint policy shared by every crate.
+# `-D warnings` is enforced on the command line (see DEVELOPMENT_PLAN.md 29).
+[workspace.lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,14 @@
+# Rust build artifacts.
+/target/
+
+# Backups and IDE folders.
+*.rs.bk
+.idea/
+.vscode/
+
+# Pre-reserved location for generated large test files (never committed).
+/test-data/large/
+
+# OS clutter.
+Thumbs.db
+.DS_Store
