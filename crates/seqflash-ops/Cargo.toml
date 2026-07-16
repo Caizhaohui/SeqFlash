@@ -5,10 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Sequence statistics and lightweight record operations (placeholder)"
+description = "Sequence statistics and lightweight record operations"
 
 [lints]
 workspace = true
 
 [dependencies]
 seqflash-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
