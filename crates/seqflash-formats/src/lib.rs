@@ -1,11 +1,17 @@
 //! FASTA/FASTQ detection, parsing, and validation.
 //!
-//! **Status (M0): placeholder.** No implementation yet.
+//! Per `DEVELOPMENT_PLAN.md` section 9.3 / 13, this crate performs format
+//! detection, FASTA record parsing, and header/ID extraction. It never assumes
+//! files are UTF-8, sequences are single-line, files end with a newline, or
+//! files only contain LF — all parsing is byte-oriented.
 //!
-//! Per `DEVELOPMENT_PLAN.md` section 9.3 / 13 / 14, this crate must never
-//! assume: files are UTF-8, FASTA sequences are single-line, FASTQ records are
-//! strictly four lines, files end with a newline, files only contain LF, or
-//! headers are printable ASCII. The FASTQ parser will be a state machine that
-//! tolerates multi-line sequence/quality, CRLF, truncation, and empty records.
+//! M3 scope: FASTA detection + header/ID extraction. FASTQ state-machine
+//! parsing arrives in M4.
 
 #![forbid(unsafe_code)]
+
+mod detect;
+mod fasta;
+
+pub use detect::detect_format;
+pub use fasta::{parse_fasta_header, FastaHeader};
