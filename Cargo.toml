@@ -48,6 +48,12 @@ serde_json = "1"
 # Platform helpers
 directories = "6"
 
+# Large-file I/O
+memmap2 = "0.9"
+
+# Native file dialogs
+rfd = "0.15"
+
 # Internal crates.
 seqflash-types = { path = "crates/seqflash-types" }
 seqflash-settings = { path = "crates/seqflash-settings" }

@@ -40,13 +40,17 @@ fn main() -> Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         ?log_dir,
-        "SeqFlash starting (M0)"
+        "SeqFlash starting (M1)"
     );
 
     let settings = load_settings();
     tracing::info!(?settings.theme, "settings loaded");
 
-    run_window(settings)
+    // Optional: a file path passed as the first CLI argument is opened on
+    // startup (basis for double-click / file-association launching).
+    let initial_file = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+
+    run_window(settings, initial_file)
 }
 
 /// Resolve the per-user log directory and make sure it exists.
@@ -120,11 +124,14 @@ fn load_settings() -> AppSettings {
 }
 
 /// Create and run the `eframe` window.
-fn run_window(settings: AppSettings) -> Result<()> {
+fn run_window(settings: AppSettings, initial_file: Option<PathBuf>) -> Result<()> {
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size(egui::vec2(960.0, 600.0))
         .with_min_inner_size(egui::vec2(640.0, 400.0))
-        .with_active(true);
+        .with_active(true)
+        // Enable native drag-and-drop on Windows so dropped files reach egui's
+        // `raw.dropped_files`. (No-op on other platforms.)
+        .with_drag_and_drop(true);
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
@@ -136,7 +143,7 @@ fn run_window(settings: AppSettings) -> Result<()> {
         Box::new(move |cc| {
             // Apply the configured theme to the egui context.
             apply_theme(cc, &settings);
-            Ok(Box::new(app::SeqFlashApp::new(settings)))
+            Ok(Box::new(app::SeqFlashApp::new(settings, initial_file)))
         }),
     )
     .map_err(|err| anyhow::anyhow!("eframe window loop exited with an error: {err}"))?;

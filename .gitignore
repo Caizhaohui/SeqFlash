@@ -5,6 +5,7 @@
 *.rs.bk
 .idea/
 .vscode/
+.zcode/
 
 # Pre-reserved location for generated large test files (never committed).
 /test-data/large/
