@@ -8,6 +8,7 @@
 mod ui;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
@@ -27,6 +28,9 @@ pub(crate) struct SeqFlashApp {
     recent_files: Vec<PathBuf>,
     /// Transient user-facing notice (error opening a file, change detected, …).
     notice: Option<String>,
+    /// Path picked by an async file-dialog worker thread, awaited on the UI
+    /// thread each frame. Shared (cloned) into the spawned dialog task.
+    pending_open: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl SeqFlashApp {
@@ -39,11 +43,23 @@ impl SeqFlashApp {
             active_document: None,
             recent_files: Vec::new(),
             notice: None,
+            pending_open: Arc::new(Mutex::new(None)),
         };
         if let Some(path) = initial_file {
             app.open_path(&path);
         }
         app
+    }
+
+    /// Drain a path produced by an async file-dialog worker, if any.
+    /// Called once per frame from `update` so the UI thread never blocks on
+    /// the native dialog.
+    fn take_pending_open(&self) -> Option<PathBuf> {
+        // Lock failures are treated as "no pending path" rather than panicking.
+        self.pending_open
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// Number of open documents (used by the UI for empty-state checks).
@@ -100,18 +116,35 @@ impl SeqFlashApp {
         }
     }
 
-    /// Show the native file-open dialog and open the picked file.
-    pub(crate) fn open_from_dialog(&mut self) {
-        let selection = rfd::FileDialog::new()
-            .add_filter(
-                "Sequence files",
-                &["fa", "fasta", "fas", "fna", "fq", "fastq"],
-            )
-            .add_filter("All files", &["*"])
-            .pick_file();
-        if let Some(path) = selection {
-            self.open_path(&path);
+    /// Show the native file-open dialog on a worker thread so the UI thread
+    /// does not block while the user picks a file. The picked path is
+    /// delivered back via `pending_open` and applied on a subsequent frame.
+    pub(crate) fn open_from_dialog(&mut self, ctx: &egui::Context) {
+        // If a dialog is already in flight, ignore the request.
+        if self.pending_open.lock().is_ok_and(|g| g.is_some()) {
+            return;
         }
+        let slot = Arc::clone(&self.pending_open);
+        // egui::Context is cheaply clonable (Arc-backed); keep a copy so the
+        // worker can wake the UI thread once a path is ready.
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let selection = rfd::FileDialog::new()
+                .add_filter(
+                    "Sequence files",
+                    &["fa", "fasta", "fas", "fna", "fq", "fastq"],
+                )
+                .add_filter("All files", &["*"])
+                .pick_file();
+            if let Some(path) = selection {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(path);
+                }
+                // Wake the UI so the pending path is applied promptly instead
+                // of waiting for the next user input.
+                ctx.request_repaint();
+            }
+        });
     }
 
     /// Close a document and release its memory map. If it was the active tab,
@@ -154,6 +187,11 @@ impl SeqFlashApp {
 
 impl eframe::App for SeqFlashApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply a path picked by an async file-dialog worker, if it has landed.
+        if let Some(path) = self.take_pending_open() {
+            self.open_path(&path);
+        }
+
         // Handle files dragged onto the window. On Windows the backend fills
         // `DroppedFile.path` only (no inline bytes), so we open from disk.
         let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());

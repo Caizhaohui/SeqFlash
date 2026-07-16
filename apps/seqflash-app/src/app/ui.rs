@@ -39,7 +39,7 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
 fn toolbar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         if ui.button("Open…").clicked() {
-            app.open_from_dialog();
+            app.open_from_dialog(ui.ctx());
         }
         if app.active_document.is_some() && ui.button("Check source").clicked() {
             app.check_active_source();
