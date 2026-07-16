@@ -15,8 +15,8 @@ use eframe::egui;
 
 use seqflash_document::{Document, DocumentList};
 use seqflash_formats::detect_format;
-use seqflash_index::FastaIndex;
-use seqflash_ops::{count_bases, gc_percent, BaseCounts};
+use seqflash_index::{FastaIndex, FastqIndex};
+use seqflash_ops::{count_bases, gc_percent, phred33_quality_stats, BaseCounts, QualityStats};
 use seqflash_settings::AppSettings;
 use seqflash_types::DocumentId;
 use seqflash_viewer::RawTextViewer;
@@ -41,6 +41,8 @@ pub(crate) struct SeqFlashApp {
     viewers: HashMap<DocumentId, RawTextViewer>,
     /// One FASTA record index per open document (lazy, built incrementally).
     fasta_indexes: HashMap<DocumentId, FastaIndex>,
+    /// One FASTQ record index per open document (lazy).
+    fastq_indexes: HashMap<DocumentId, FastqIndex>,
     /// Currently selected record number (0-indexed), or None if no record is
     /// active. Navigation buttons update this; clicking a record in the list
     /// sets it and scrolls the viewer.
@@ -68,6 +70,7 @@ impl SeqFlashApp {
             pending_open: Arc::new(Mutex::new(None)),
             viewers: HashMap::new(),
             fasta_indexes: HashMap::new(),
+            fastq_indexes: HashMap::new(),
             current_record_number: None,
             active_top_offset: 0,
             pending_clipboard: None,
@@ -203,6 +206,7 @@ impl SeqFlashApp {
         // Drop the viewer (and its line index) for the closed document.
         self.viewers.remove(&id);
         self.fasta_indexes.remove(&id);
+        self.fastq_indexes.remove(&id);
         if was_active {
             self.active_document = self.documents.iter().next().map(Document::id);
             self.active_top_offset = 0;
@@ -229,7 +233,16 @@ impl SeqFlashApp {
         self.fasta_indexes.get_mut(&id)
     }
 
-    /// Advance the background FASTA index scan for the active document.
+    /// Borrow the FASTQ index for `id`, creating it lazily.
+    pub(crate) fn index_for_fastq(&mut self, id: DocumentId) -> Option<&mut FastqIndex> {
+        let file_size = self.documents.get(id).map(|d| d.metadata().size)?;
+        self.fastq_indexes
+            .entry(id)
+            .or_insert_with(|| FastqIndex::new(file_size));
+        self.fastq_indexes.get_mut(&id)
+    }
+
+    /// Advance the background index scan (FASTA or FASTQ) for the active doc.
     fn advance_index_scan(&mut self) {
         let Some(id) = self.active_document else {
             return;
@@ -238,9 +251,50 @@ impl SeqFlashApp {
             return;
         };
         let bytes = doc.bytes();
-        if let Some(idx) = self.fasta_indexes.get_mut(&id) {
-            idx.scan_chunk(bytes, seqflash_index::DEFAULT_INDEX_SCAN_BUDGET);
+        match doc.format() {
+            seqflash_types::SequenceFormat::Fasta => {
+                if let Some(idx) = self.fasta_indexes.get_mut(&id) {
+                    idx.scan_chunk(bytes, seqflash_index::DEFAULT_INDEX_SCAN_BUDGET);
+                }
+            }
+            seqflash_types::SequenceFormat::Fastq => {
+                if let Some(idx) = self.fastq_indexes.get_mut(&id) {
+                    idx.scan_chunk(bytes, seqflash_index::FASTQ_INDEX_BUDGET);
+                }
+            }
+            seqflash_types::SequenceFormat::Unknown => {}
         }
+    }
+
+    /// Active FastqIndex for UI read.
+    #[must_use]
+    pub(crate) fn active_fastq_index(&self) -> Option<&FastqIndex> {
+        self.active_document
+            .and_then(|id| self.fastq_indexes.get(&id))
+    }
+
+    /// Quality stats for a FASTQ record.
+    #[must_use]
+    pub(crate) fn fastq_quality_for(&self, id: DocumentId, rec_num: u64) -> Option<QualityStats> {
+        let doc = self.documents.get(id)?;
+        let idx = self.fastq_indexes.get(&id)?;
+        let entry = idx
+            .entries()
+            .get(usize::try_from(rec_num).unwrap_or(usize::MAX))?;
+        let bytes = doc.bytes();
+        let qs = usize::try_from(entry.quality_range.start).unwrap_or(0);
+        let qe = usize::try_from(entry.quality_range.end)
+            .unwrap_or(bytes.len())
+            .min(bytes.len());
+        if qs >= qe {
+            return None;
+        }
+        let qual: Vec<u8> = bytes[qs..qe]
+            .iter()
+            .copied()
+            .filter(|&b| b != b'\n' && b != b'\r')
+            .collect();
+        Some(phred33_quality_stats(&qual, 20))
     }
 
     /// The currently selected record number (0-based), within the active

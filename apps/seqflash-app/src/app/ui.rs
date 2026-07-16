@@ -174,6 +174,9 @@ fn empty_state(ui: &mut egui::Ui) {
 
 /// Left panel: record list, search, prev/next, jump-to-record.
 const LIST_LIMIT: usize = 500;
+type IndexMeta = Option<(usize, bool, u8, Vec<(String, bool)>)>;
+
+#[allow(clippy::too_many_lines)]
 fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.heading("Records");
     ui.add_space(4.0);
@@ -182,38 +185,68 @@ fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
         ui.label("No document open.");
         return;
     };
-    // Lazily create the index.
-    app.index_for(doc_id);
+    // Determine format and create appropriate index.
+    let doc = app.active_document();
+    let is_fastq = doc.is_some_and(|d| d.format() == seqflash_types::SequenceFormat::Fastq);
+    if is_fastq {
+        app.index_for_fastq(doc_id);
+    } else {
+        app.index_for(doc_id);
+    }
 
-    let idx = match app.active_fasta_index() {
-        Some(idx) if idx.entry_count() > 0 => idx,
-        _ => {
-            if let Some(idx) = app.active_fasta_index() {
-                let pct = if idx.is_complete() {
-                    100
-                } else {
-                    u8::try_from(idx.scan_progress() * 100 / app.active_file_size().max(1))
+    // Collect index metadata, dispatching by format.
+    // We store (total, complete, progress_pct, has_records, entry_data)
+    // where entry_data is Vec<(label: String, is_error: bool)> for the record list.
+    let idx_meta: IndexMeta = if is_fastq {
+        app.active_fastq_index().map(|idx| {
+            let pct = u8::try_from(idx.scan_progress() * 100 / app.active_file_size().max(1))
+                .unwrap_or(0);
+            let total = idx.entry_count();
+            let complete = idx.is_complete();
+            let entries: Vec<(String, bool)> = idx
+                .entries()
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let label =
+                        format!("{}. {}", i + 1, if e.validation.valid { "✓" } else { "⚠" });
+                    (label, !e.validation.valid)
+                })
+                .collect();
+            (total, complete, pct, entries)
+        })
+    } else {
+        app.active_fasta_index().map(|idx| {
+            let pct = u8::try_from(idx.scan_progress() * 100 / app.active_file_size().max(1))
+                .unwrap_or(0);
+            let total = idx.entry_count();
+            let complete = idx.is_complete();
+            let doc_bytes: &[u8] = app.active_document().map_or(&[][..], |d| d.bytes());
+            let entries: Vec<(String, bool)> = idx
+                .entries()
+                .iter()
+                .map(|e| {
+                    let id_start = usize::try_from(e.id_range.start)
                         .unwrap_or(0)
-                };
-                ui.label(format!("Indexing… {pct}%"));
-            } else {
-                ui.label("No FASTA index.");
-            }
-            return;
-        }
+                        .min(doc_bytes.len());
+                    let id_end = usize::try_from(e.id_range.end)
+                        .unwrap_or(id_start)
+                        .min(doc_bytes.len());
+                    let id_str = if id_end > id_start {
+                        String::from_utf8_lossy(&doc_bytes[id_start..id_end]).into_owned()
+                    } else {
+                        String::new()
+                    };
+                    (format!("{}. {}", e.record_number + 1, id_str), false)
+                })
+                .collect();
+            (total, complete, pct, entries)
+        })
     };
 
-    // Navigation buttons — operate before borrowing idx info via shared
-    // reference to avoid conflicts with the mutable closures below.
-    let (total, complete, rec_entries, progress_pct) = {
-        let idx_pct =
-            u8::try_from(idx.scan_progress() * 100 / app.active_file_size().max(1)).unwrap_or(0);
-        (
-            idx.entry_count(),
-            idx.is_complete(),
-            idx.entries().to_vec(),
-            idx_pct,
-        )
+    let Some((total, complete, progress_pct, rec_entries)) = idx_meta else {
+        ui.label("Indexing…");
+        return;
     };
 
     let done_str = if complete {
@@ -258,28 +291,27 @@ fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     // Scrollable record list (limited to avoid rendering 100k+ labels).
     let shown = rec_entries.len().min(LIST_LIMIT);
     let current = app.current_record_number();
-    // Pre-compute the displayed labels so the `.show()` closure doesn't need to
-    // immutably borrow `app` while the mutable `app.go_to_record` calls require
-    // unique access.
-    let doc_bytes_slice: &[u8] = app.active_document().map_or(&[][..], |d| d.bytes());
-    let shown_labels: Vec<(usize, u64, String)> = rec_entries
+    // Rec_entries already has pre-computed (label, is_error) pairs.
+    // Build (index, is_active, label, is_error) for the closure.
+    let display_items: Vec<(usize, bool, String, bool)> = rec_entries
         .iter()
         .take(shown)
         .enumerate()
-        .map(|(i, entry)| {
-            let id_bytes = id_slice_from_entry(entry, doc_bytes_slice);
-            let id_str = String::from_utf8_lossy(&id_bytes).into_owned();
-            (i, i as u64, format!("{}. {}", i + 1, id_str))
-        })
+        .map(|(i, (label, is_error))| (i, current == Some(i as u64), label.clone(), *is_error))
         .collect();
 
     egui::ScrollArea::vertical()
         .id_salt("rec_list")
         .show(ui, |ui| {
-            for (_i, rec_num, label) in &shown_labels {
-                let is_current = current == Some(*rec_num);
-                if ui.selectable_label(is_current, label).clicked() {
-                    app.go_to_record(*rec_num);
+            for (idx, is_current, label, is_error) in &display_items {
+                let rich = if *is_error {
+                    egui::RichText::new(label.as_str()).color(egui::Color32::RED)
+                } else {
+                    egui::RichText::new(label.as_str())
+                };
+                let resp = ui.selectable_label(*is_current, rich);
+                if resp.clicked() {
+                    app.go_to_record(*idx as u64);
                 }
             }
         });
@@ -289,15 +321,6 @@ fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
             rec_entries.len()
         ));
     }
-}
-
-/// Extract the ID bytes for an entry from the document byte buffer.
-fn id_slice_from_entry(entry: &seqflash_index::FastaRecordEntry, doc_bytes: &[u8]) -> Vec<u8> {
-    let start = usize::try_from(entry.id_range.start).unwrap_or(0);
-    let end = usize::try_from(entry.id_range.end)
-        .unwrap_or(doc_bytes.len())
-        .min(doc_bytes.len());
-    doc_bytes[start..end].to_vec()
 }
 
 /// Right panel: record statistics.
@@ -313,33 +336,66 @@ fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
         ui.label("Click a record to view stats.");
         return;
     };
-    let Some((counts, gc)) = app.record_stats(doc_id, rec) else {
-        ui.label("Stats unavailable.");
-        return;
-    };
+    let doc = app.active_document();
+    let is_fastq = doc.is_some_and(|d| d.format() == seqflash_types::SequenceFormat::Fastq);
 
-    ui.label(format!("Record #: {}", rec + 1));
-    ui.label(format!("Length: {} bases", counts.total()));
-    ui.label(format!("GC: {gc:.1}%"));
-    ui.separator();
-    ui.label(format!("A: {}", counts.a));
-    ui.label(format!("C: {}", counts.c));
-    ui.label(format!("G: {}", counts.g));
-    ui.label(format!("T: {}", counts.t));
-    if counts.u > 0 {
-        ui.label(format!("U: {}", counts.u));
-    }
-    ui.label(format!("N: {}", counts.n));
-    ui.label(format!("Other (IUPAC/gap): {}", counts.other));
-    if counts.illegal > 0 {
-        ui.label(
-            egui::RichText::new(format!("Illegal chars: {}", counts.illegal))
-                .color(egui::Color32::RED),
-        );
-    }
-    let total_acgt = counts.a + counts.c + counts.g + counts.t + counts.u;
-    if total_acgt == 0 {
-        ui.label("Empty sequence");
+    if is_fastq {
+        // Quality stats for FASTQ.
+        if let Some(qs) = app.fastq_quality_for(doc_id, rec) {
+            ui.label(format!("Record #: {}", rec + 1));
+            ui.label(format!("Length: {}", qs.total));
+            ui.label(format!("Min Q: {}", qs.min));
+            ui.label(format!("Max Q: {}", qs.max));
+            ui.label(format!("Avg Q: {:.1}", qs.avg));
+            ui.separator();
+            #[allow(clippy::cast_precision_loss)]
+            let low_pct = if qs.total > 0 {
+                (qs.low_quality_count as f64 / qs.total as f64) * 100.0
+            } else {
+                0.0
+            };
+            if qs.low_quality_count > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Low qual (<Q20): {:.1}% ({})",
+                        low_pct, qs.low_quality_count
+                    ))
+                    .color(egui::Color32::RED),
+                );
+            } else {
+                ui.label("Low qual (<Q20): none");
+            }
+        } else {
+            ui.label("Quality stats unavailable.");
+        }
+    } else {
+        // Base-count stats for FASTA.
+        if let Some((counts, gc)) = app.record_stats(doc_id, rec) {
+            ui.label(format!("Record #: {}", rec + 1));
+            ui.label(format!("Length: {} bases", counts.total()));
+            ui.label(format!("GC: {gc:.1}%"));
+            ui.separator();
+            ui.label(format!("A: {}", counts.a));
+            ui.label(format!("C: {}", counts.c));
+            ui.label(format!("G: {}", counts.g));
+            ui.label(format!("T: {}", counts.t));
+            if counts.u > 0 {
+                ui.label(format!("U: {}", counts.u));
+            }
+            ui.label(format!("N: {}", counts.n));
+            ui.label(format!("Other (IUPAC/gap): {}", counts.other));
+            if counts.illegal > 0 {
+                ui.label(
+                    egui::RichText::new(format!("Illegal chars: {}", counts.illegal))
+                        .color(egui::Color32::RED),
+                );
+            }
+            if counts.a + counts.c + counts.g + counts.t + counts.u == 0 {
+                ui.label("Empty sequence");
+            }
+        } else {
+            ui.label("Stats unavailable.");
+        }
     }
 }
 

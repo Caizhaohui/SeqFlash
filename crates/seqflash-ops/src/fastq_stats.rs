@@ -107,6 +107,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn empty() {
         let stats = phred33_quality_stats(b"", 20);
         assert_eq!(stats.total, 0);
