@@ -5,10 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "FASTA/FASTQ record boundary indexing and line checkpoints (placeholder)"
+description = "FASTA/FASTQ record boundary indexing and line checkpoints"
 
 [lints]
 workspace = true
 
 [dependencies]
+seqflash-formats = { workspace = true }
 seqflash-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
