@@ -239,4 +239,31 @@ mod tests {
             Err(DocumentError::Open(_))
         ));
     }
+
+    #[test]
+    fn open_chinese_filename_reads_bytes_and_metadata() {
+        // Windows paths carry arbitrary Unicode via UTF-16 (WTF-16); this test
+        // exercises the same CreateFileW code path the production GUI uses.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("序列数据.fasta");
+        let doc = doc_with(&path, ">染色体1\nACGTACGT\n".as_bytes());
+
+        assert_eq!(doc.bytes(), ">染色体1\nACGTACGT\n".as_bytes());
+        assert_eq!(doc.metadata().path, path);
+        assert_eq!(doc.metadata().size, ">染色体1\nACGTACGT\n".len() as u64);
+    }
+
+    #[test]
+    fn open_chinese_directory_in_path() {
+        // A Chinese-named subdirectory in the path (not just the filename).
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("数据").join("样本");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("reads.fastq");
+        let doc = doc_with(&path, b"@read1\nACGT\n+\nIIII\n");
+
+        assert_eq!(doc.bytes(), b"@read1\nACGT\n+\nIIII\n");
+        assert!(doc.metadata().path.ends_with("reads.fastq"));
+        assert!(doc.metadata().path.starts_with(sub));
+    }
 }
