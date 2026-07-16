@@ -7,6 +7,7 @@
 
 mod ui;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +16,7 @@ use eframe::egui;
 use seqflash_document::{Document, DocumentList};
 use seqflash_settings::AppSettings;
 use seqflash_types::DocumentId;
+use seqflash_viewer::RawTextViewer;
 
 /// Maximum number of entries kept in the in-memory recent-files list.
 const RECENT_FILES_LIMIT: usize = 10;
@@ -31,6 +33,17 @@ pub(crate) struct SeqFlashApp {
     /// Path picked by an async file-dialog worker thread, awaited on the UI
     /// thread each frame. Shared (cloned) into the spawned dialog task.
     pending_open: Arc<Mutex<Option<PathBuf>>>,
+    /// One persistent raw-text viewer per open document (holds its line index
+    /// and scroll state). Removed when the document is closed.
+    viewers: HashMap<DocumentId, RawTextViewer>,
+    /// Byte offset currently at the top of the active viewer's viewport.
+    active_top_offset: u64,
+    /// Text staged for clipboard copy; drained by the UI layer each frame.
+    pending_clipboard: Option<String>,
+    /// Whether the "Go to offset" dialog is open.
+    show_goto_offset: bool,
+    /// Current text in the "Go to offset" input.
+    goto_offset_input: String,
 }
 
 impl SeqFlashApp {
@@ -44,6 +57,11 @@ impl SeqFlashApp {
             recent_files: Vec::new(),
             notice: None,
             pending_open: Arc::new(Mutex::new(None)),
+            viewers: HashMap::new(),
+            active_top_offset: 0,
+            pending_clipboard: None,
+            show_goto_offset: false,
+            goto_offset_input: String::new(),
         };
         if let Some(path) = initial_file {
             app.open_path(&path);
@@ -157,12 +175,101 @@ impl SeqFlashApp {
     pub(crate) fn close_document(&mut self, id: DocumentId) {
         let was_active = self.active_document == Some(id);
         self.documents.close(id);
+        // Drop the viewer (and its line index) for the closed document.
+        self.viewers.remove(&id);
         if was_active {
             self.active_document = self.documents.iter().next().map(Document::id);
+            self.active_top_offset = 0;
         }
     }
 
-    /// Check the active document for on-disk changes since it was opened.
+    /// Borrow the viewer for `id`, creating it lazily on first access from the
+    /// document's file size. Returns `None` only if the document is gone.
+    pub(crate) fn viewer_for(&mut self, id: DocumentId) -> Option<&mut RawTextViewer> {
+        let file_size = self.documents.get(id).map(|d| d.metadata().size)?;
+        self.viewers
+            .entry(id)
+            .or_insert_with(|| RawTextViewer::new(file_size));
+        self.viewers.get_mut(&id)
+    }
+
+    /// Scroll the active viewer to a byte offset (Home/End / "Go to offset").
+    pub(crate) fn scroll_active_to_byte(&mut self, byte_offset: u64) {
+        if let Some(id) = self.active_document {
+            if let Some(viewer) = self.viewers.get_mut(&id) {
+                viewer.scroll_to_byte(byte_offset);
+            }
+        }
+    }
+
+    /// The byte offset at the top of the active viewport (for the status bar).
+    #[must_use]
+    pub(crate) const fn active_top_offset(&self) -> u64 {
+        self.active_top_offset
+    }
+
+    /// Record the top offset reported by the viewer this frame.
+    pub(crate) fn set_active_top_offset(&mut self, offset: u64) {
+        self.active_top_offset = offset;
+    }
+
+    /// Drain any text staged for clipboard copy.
+    pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
+    /// Open the "Go to offset" dialog.
+    pub(crate) fn open_goto_offset_dialog(&mut self) {
+        self.show_goto_offset = true;
+        self.goto_offset_input.clear();
+    }
+
+    /// Whether the "Go to offset" dialog should be shown.
+    #[must_use]
+    pub(crate) const fn show_goto_offset(&self) -> bool {
+        self.show_goto_offset
+    }
+
+    /// Borrow the "Go to offset" input text (mutably).
+    pub(crate) fn goto_offset_input_mut(&mut self) -> &mut String {
+        &mut self.goto_offset_input
+    }
+
+    /// Close the "Go to offset" dialog and, if `apply` is true, jump there.
+    pub(crate) fn close_goto_offset_dialog(&mut self, apply: bool) {
+        if apply {
+            if let Ok(offset) = self.goto_offset_input.trim().parse::<u64>() {
+                self.scroll_active_to_byte(offset);
+            }
+        }
+        self.show_goto_offset = false;
+    }
+
+    /// The active document's file size (for the goto dialog's hint).
+    #[must_use]
+    pub(crate) fn active_file_size(&self) -> u64 {
+        self.active_document().map_or(0, |d| d.metadata().size)
+    }
+
+    /// Copy the visible text of the active document to the clipboard.
+    pub(crate) fn copy_active_visible_text(&mut self) {
+        // M2 basic copy: copy a bounded prefix of the file (first 64 KiB) as
+        // lossy text. Full visible-viewport copy is a refinement for later.
+        const COPY_LIMIT: usize = 64 * 1024;
+
+        let Some(id) = self.active_document else {
+            return;
+        };
+        let Some(doc) = self.documents.get(id) else {
+            return;
+        };
+        let bytes = doc.bytes();
+        let end = bytes.len().min(COPY_LIMIT);
+        let text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        self.notice = Some(format!("Copied first {end} bytes to clipboard."));
+        // Stash the text so the UI layer can place it on the clipboard.
+        self.pending_clipboard = Some(text);
+    }
     pub(crate) fn check_active_source(&mut self) {
         let Some(id) = self.active_document else {
             return;

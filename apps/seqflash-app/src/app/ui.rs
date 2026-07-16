@@ -1,6 +1,7 @@
-//! M1 window layout: a toolbar, a tab strip, a byte-level preview, and a
-//! status bar. This is a deliberate stepping stone — the full three-pane
-//! layout (plan section 22) and the virtual-scrolling viewer (M2) come later.
+//! M2 window layout: a toolbar (open / go-to-offset / copy / check), a tab
+//! strip, the virtual-scrolling raw-text viewer, a "Go to offset" modal, and
+//! a status bar with the current byte offset. The full three-pane layout
+//! (plan section 22) comes in a later milestone.
 
 use std::path::Path;
 
@@ -28,28 +29,90 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
 
     egui::CentralPanel::default().show(ctx, |ui| {
         let active_id = app.active_document_id();
-        if let (Some(doc_id), Some(doc)) = (active_id, app.active_document()) {
-            preview(doc_id, doc, ui);
+        if let Some(doc_id) = active_id {
+            // Ensure a viewer exists for this document (lazily created).
+            app.viewer_for(doc_id);
+            // Take the viewer out of the map so we can borrow `app.documents`
+            // for the bytes slice at the same time (avoids a borrow conflict).
+            let mut viewer = app.viewers.remove(&doc_id);
+            let bytes = app.documents.get(doc_id).map_or(&[][..], Document::bytes);
+            let top_offset = match &mut viewer {
+                Some(v) => v.show(ui, ("raw_text_view", doc_id.get()), bytes),
+                None => 0,
+            };
+            app.set_active_top_offset(top_offset);
+            if let Some(v) = viewer {
+                app.viewers.insert(doc_id, v);
+            }
         } else {
             empty_state(ui);
         }
     });
+
+    // Drain any pending clipboard copy onto the egui command queue.
+    if let Some(text) = app.take_pending_clipboard() {
+        ctx.copy_text(text);
+    }
+
+    // "Go to offset" modal dialog.
+    if app.show_goto_offset() {
+        goto_offset_dialog(app, ctx);
+    }
 }
 
-/// Toolbar: Open button + change-check button + drag hint.
+/// Modal dialog for jumping to a byte offset.
+fn goto_offset_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let mut open = true;
+    let file_size = app.active_file_size();
+    egui::Window::new("Go to offset")
+        .open(&mut open)
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label(format!("Enter a byte offset (0 – {file_size}):"));
+            ui.add(
+                egui::TextEdit::singleline(app.goto_offset_input_mut())
+                    .hint_text("e.g. 1048576")
+                    .desired_width(220.0),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Go").clicked() {
+                    app.close_goto_offset_dialog(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    app.close_goto_offset_dialog(false);
+                }
+            });
+        });
+    if !open {
+        app.close_goto_offset_dialog(false);
+    }
+}
+
+/// Toolbar: Open / Go to offset / Copy visible / Check source + drag hint.
 fn toolbar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         if ui.button("Open…").clicked() {
             app.open_from_dialog(ui.ctx());
         }
-        if app.active_document.is_some() && ui.button("Check source").clicked() {
-            app.check_active_source();
+        if app.active_document.is_some() {
+            if ui.button("Go to offset…").clicked() {
+                app.open_goto_offset_dialog();
+            }
+            if ui.button("Copy visible").clicked() {
+                app.copy_active_visible_text();
+            }
+            if ui.button("Check source").clicked() {
+                app.check_active_source();
+            }
         }
         ui.separator();
         ui.label(
-            egui::RichText::new("Tip: drag .fasta / .fastq files onto the window")
-                .weak()
-                .small(),
+            egui::RichText::new(
+                "Tip: drag .fasta / .fastq files onto the window; Home/End/PgUp/PgDn to navigate",
+            )
+            .weak()
+            .small(),
         );
     });
 }
@@ -89,22 +152,6 @@ fn tab_strip(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Central area when a document is open: the virtual-scrolling byte viewer.
-///
-/// Only the visible rows are formatted and drawn (`show_viewport`); the whole
-/// file is never handed to a widget or scanned during rendering (plan 9.5).
-fn preview(doc_id: DocumentId, doc: &Document, ui: &mut egui::Ui) {
-    use seqflash_viewer::ByteViewer;
-
-    ui.heading("Raw byte view");
-    ui.add_space(4.0);
-
-    // One ByteViewer per central panel; it is cheap (just a width config) and
-    // stateless — scroll position is persisted by egui keyed on `id_salt`.
-    let viewer = ByteViewer::new();
-    viewer.show(ui, ("byte_view", doc_id.get()), doc.bytes());
-}
-
 /// Central area when no document is open.
 fn empty_state(ui: &mut egui::Ui) {
     ui.vertical_centered(|ui| {
@@ -126,6 +173,11 @@ fn status_bar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
                 let meta = doc.metadata();
                 ui.label(format!("📄 {}", display_path(&meta.path)));
                 ui.label(byte_size_label(meta.size));
+                ui.label(format!(
+                    "offset {} / {}",
+                    app.active_top_offset(),
+                    meta.size
+                ));
                 ui.label("Unknown"); // format detection arrives in M3/M4
                 ui.label(format!("tab {}/{}", tab_index(app, doc.id()) + 1, count));
             }
