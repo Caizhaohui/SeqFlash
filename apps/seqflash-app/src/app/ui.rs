@@ -1,7 +1,6 @@
-//! M2 window layout: a toolbar (open / go-to-offset / copy / check), a tab
-//! strip, the virtual-scrolling raw-text viewer, a "Go to offset" modal, and
-//! a status bar with the current byte offset. The full three-pane layout
-//! (plan section 22) comes in a later milestone.
+//! M3 window layout: toolbar, tab strip, left record panel, central viewer,
+//! right info panel with record stats, and a status bar with format/index
+//! progress/record count.
 
 use std::path::Path;
 
@@ -27,13 +26,26 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
         status_bar(app, ui);
     });
 
+    // Left record-navigation panel.
+    egui::SidePanel::left("record_nav")
+        .default_width(220.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            record_nav_panel(app, ui);
+        });
+
+    // Right info/stats panel.
+    egui::SidePanel::right("info_panel")
+        .default_width(240.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            info_panel(app, ui);
+        });
+
     egui::CentralPanel::default().show(ctx, |ui| {
         let active_id = app.active_document_id();
         if let Some(doc_id) = active_id {
-            // Ensure a viewer exists for this document (lazily created).
             app.viewer_for(doc_id);
-            // Take the viewer out of the map so we can borrow `app.documents`
-            // for the bytes slice at the same time (avoids a borrow conflict).
             let mut viewer = app.viewers.remove(&doc_id);
             let bytes = app.documents.get(doc_id).map_or(&[][..], Document::bytes);
             let top_offset = match &mut viewer {
@@ -49,12 +61,9 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
         }
     });
 
-    // Drain any pending clipboard copy onto the egui command queue.
     if let Some(text) = app.take_pending_clipboard() {
         ctx.copy_text(text);
     }
-
-    // "Go to offset" modal dialog.
     if app.show_goto_offset() {
         goto_offset_dialog(app, ctx);
     }
@@ -163,7 +172,178 @@ fn empty_state(ui: &mut egui::Ui) {
     });
 }
 
-/// Bottom status bar: path, size, format, active tab.
+/// Left panel: record list, search, prev/next, jump-to-record.
+const LIST_LIMIT: usize = 500;
+fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
+    ui.heading("Records");
+    ui.add_space(4.0);
+
+    let Some(doc_id) = app.active_document_id() else {
+        ui.label("No document open.");
+        return;
+    };
+    // Lazily create the index.
+    app.index_for(doc_id);
+
+    let idx = match app.active_fasta_index() {
+        Some(idx) if idx.entry_count() > 0 => idx,
+        _ => {
+            if let Some(idx) = app.active_fasta_index() {
+                let pct = if idx.is_complete() {
+                    100
+                } else {
+                    u8::try_from(idx.scan_progress() * 100 / app.active_file_size().max(1))
+                        .unwrap_or(0)
+                };
+                ui.label(format!("Indexing… {pct}%"));
+            } else {
+                ui.label("No FASTA index.");
+            }
+            return;
+        }
+    };
+
+    // Navigation buttons — operate before borrowing idx info via shared
+    // reference to avoid conflicts with the mutable closures below.
+    let (total, complete, rec_entries, progress_pct) = {
+        let idx_pct =
+            u8::try_from(idx.scan_progress() * 100 / app.active_file_size().max(1)).unwrap_or(0);
+        (
+            idx.entry_count(),
+            idx.is_complete(),
+            idx.entries().to_vec(),
+            idx_pct,
+        )
+    };
+
+    let done_str = if complete {
+        " ✓".to_string()
+    } else {
+        format!(" ({progress_pct}% scanned)")
+    };
+    ui.label(format!("{total} record(s).{done_str}"));
+    ui.add_space(4.0);
+
+    // Navigation buttons.
+    ui.horizontal(|ui| {
+        if ui.button("◀ Prev").clicked() {
+            app.prev_record();
+        }
+        if ui.button("Next ▶").clicked() {
+            app.next_record();
+        }
+    });
+
+    // Record-number jump.
+    ui.horizontal(|ui| {
+        ui.label("Go to rec:");
+        let mut rec_input = String::new();
+        // We use a simple text edit; the value is consumed immediately on Enter.
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut rec_input)
+                .hint_text("1")
+                .desired_width(60.0),
+        );
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Ok(n) = rec_input.trim().parse::<u64>() {
+                if n > 0 {
+                    app.go_to_record(n - 1);
+                }
+            }
+        }
+    });
+
+    ui.separator();
+
+    // Scrollable record list (limited to avoid rendering 100k+ labels).
+    let shown = rec_entries.len().min(LIST_LIMIT);
+    let current = app.current_record_number();
+    // Pre-compute the displayed labels so the `.show()` closure doesn't need to
+    // immutably borrow `app` while the mutable `app.go_to_record` calls require
+    // unique access.
+    let doc_bytes_slice: &[u8] = app.active_document().map_or(&[][..], |d| d.bytes());
+    let shown_labels: Vec<(usize, u64, String)> = rec_entries
+        .iter()
+        .take(shown)
+        .enumerate()
+        .map(|(i, entry)| {
+            let id_bytes = id_slice_from_entry(entry, doc_bytes_slice);
+            let id_str = String::from_utf8_lossy(&id_bytes).into_owned();
+            (i, i as u64, format!("{}. {}", i + 1, id_str))
+        })
+        .collect();
+
+    egui::ScrollArea::vertical()
+        .id_salt("rec_list")
+        .show(ui, |ui| {
+            for (_i, rec_num, label) in &shown_labels {
+                let is_current = current == Some(*rec_num);
+                if ui.selectable_label(is_current, label).clicked() {
+                    app.go_to_record(*rec_num);
+                }
+            }
+        });
+    if rec_entries.len() > LIST_LIMIT {
+        ui.label(format!(
+            "… showing first {LIST_LIMIT} of {} records",
+            rec_entries.len()
+        ));
+    }
+}
+
+/// Extract the ID bytes for an entry from the document byte buffer.
+fn id_slice_from_entry(entry: &seqflash_index::FastaRecordEntry, doc_bytes: &[u8]) -> Vec<u8> {
+    let start = usize::try_from(entry.id_range.start).unwrap_or(0);
+    let end = usize::try_from(entry.id_range.end)
+        .unwrap_or(doc_bytes.len())
+        .min(doc_bytes.len());
+    doc_bytes[start..end].to_vec()
+}
+
+/// Right panel: record statistics.
+fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
+    ui.heading("Record Info");
+    ui.add_space(4.0);
+
+    let Some(doc_id) = app.active_document_id() else {
+        ui.label("No document.");
+        return;
+    };
+    let Some(rec) = app.current_record_number() else {
+        ui.label("Click a record to view stats.");
+        return;
+    };
+    let Some((counts, gc)) = app.record_stats(doc_id, rec) else {
+        ui.label("Stats unavailable.");
+        return;
+    };
+
+    ui.label(format!("Record #: {}", rec + 1));
+    ui.label(format!("Length: {} bases", counts.total()));
+    ui.label(format!("GC: {gc:.1}%"));
+    ui.separator();
+    ui.label(format!("A: {}", counts.a));
+    ui.label(format!("C: {}", counts.c));
+    ui.label(format!("G: {}", counts.g));
+    ui.label(format!("T: {}", counts.t));
+    if counts.u > 0 {
+        ui.label(format!("U: {}", counts.u));
+    }
+    ui.label(format!("N: {}", counts.n));
+    ui.label(format!("Other (IUPAC/gap): {}", counts.other));
+    if counts.illegal > 0 {
+        ui.label(
+            egui::RichText::new(format!("Illegal chars: {}", counts.illegal))
+                .color(egui::Color32::RED),
+        );
+    }
+    let total_acgt = counts.a + counts.c + counts.g + counts.t + counts.u;
+    if total_acgt == 0 {
+        ui.label("Empty sequence");
+    }
+}
+
+/// Bottom status bar: path, size, format, record count, offset.
 fn status_bar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 18.0;
@@ -173,13 +353,31 @@ fn status_bar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
                 let meta = doc.metadata();
                 ui.label(format!("📄 {}", display_path(&meta.path)));
                 ui.label(byte_size_label(meta.size));
+                // Format label (was hardcoded "Unknown" in M2; M3 uses detection).
+                ui.label(doc.format().label());
+                // Record count + indexing progress.
+                if let Some(idx) = app.active_fasta_index() {
+                    let rec = idx.entry_count();
+                    if idx.is_complete() {
+                        ui.label(format!(
+                            "Record {}/{}",
+                            app.current_record_number().map_or(0, |n| n + 1),
+                            rec
+                        ));
+                    } else {
+                        let pct =
+                            u8::try_from(idx.scan_progress() * 100 / meta.size.max(1)).unwrap_or(0);
+                        ui.label(format!(
+                            "Indexing {pct}% ({} records+dead)",
+                            idx.entry_count()
+                        ));
+                    }
+                }
                 ui.label(format!(
                     "offset {} / {}",
                     app.active_top_offset(),
                     meta.size
                 ));
-                ui.label("Unknown"); // format detection arrives in M3/M4
-                ui.label(format!("tab {}/{}", tab_index(app, doc.id()) + 1, count));
             }
             None => {
                 ui.label(format!("{count} document(s) open"));
@@ -220,11 +418,4 @@ fn byte_size_label(bytes: u64) -> String {
         MIB..GIB => format!("{}.{:01} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB),
         _ => format!("{}.{:02} GiB", bytes / GIB, (bytes % GIB) * 100 / GIB),
     }
-}
-
-fn tab_index(app: &SeqFlashApp, id: DocumentId) -> usize {
-    app.document_entries()
-        .iter()
-        .position(|(entry_id, _, _)| *entry_id == id)
-        .unwrap_or(0)
 }

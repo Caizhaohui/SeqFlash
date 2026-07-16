@@ -2752,6 +2752,9 @@ dependencies = [
  "egui",
  "rfd",
  "seqflash-document",
+ "seqflash-formats",
+ "seqflash-index",
+ "seqflash-ops",
  "seqflash-settings",
  "seqflash-types",
  "seqflash-viewer",
@@ -2775,13 +2778,16 @@ name = "seqflash-formats"
 version = "0.1.0"
 dependencies = [
  "seqflash-types",
+ "tempfile",
 ]
 
 [[package]]
 name = "seqflash-index"
 version = "0.1.0"
 dependencies = [
+ "seqflash-formats",
  "seqflash-types",
+ "tempfile",
 ]
 
 [[package]]
@@ -2796,6 +2802,7 @@ name = "seqflash-ops"
 version = "0.1.0"
 dependencies = [
  "seqflash-types",
+ "tempfile",
 ]
 
 [[package]]

@@ -25,6 +25,9 @@ anyhow = { workspace = true }
 directories = { workspace = true }
 rfd = { workspace = true }
 seqflash-document = { workspace = true }
+seqflash-formats = { workspace = true }
+seqflash-index = { workspace = true }
+seqflash-ops = { workspace = true }
 seqflash-types = { workspace = true }
 seqflash-viewer = { workspace = true }
 seqflash-settings = { workspace = true }

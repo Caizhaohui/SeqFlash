@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use seqflash_document::{Document, DocumentList};
+use seqflash_formats::detect_format;
+use seqflash_index::FastaIndex;
+use seqflash_ops::{count_bases, gc_percent, BaseCounts};
 use seqflash_settings::AppSettings;
 use seqflash_types::DocumentId;
 use seqflash_viewer::RawTextViewer;
@@ -36,6 +39,12 @@ pub(crate) struct SeqFlashApp {
     /// One persistent raw-text viewer per open document (holds its line index
     /// and scroll state). Removed when the document is closed.
     viewers: HashMap<DocumentId, RawTextViewer>,
+    /// One FASTA record index per open document (lazy, built incrementally).
+    fasta_indexes: HashMap<DocumentId, FastaIndex>,
+    /// Currently selected record number (0-indexed), or None if no record is
+    /// active. Navigation buttons update this; clicking a record in the list
+    /// sets it and scrolls the viewer.
+    current_record_number: Option<u64>,
     /// Byte offset currently at the top of the active viewer's viewport.
     active_top_offset: u64,
     /// Text staged for clipboard copy; drained by the UI layer each frame.
@@ -58,6 +67,8 @@ impl SeqFlashApp {
             notice: None,
             pending_open: Arc::new(Mutex::new(None)),
             viewers: HashMap::new(),
+            fasta_indexes: HashMap::new(),
+            current_record_number: None,
             active_top_offset: 0,
             pending_clipboard: None,
             show_goto_offset: false,
@@ -127,6 +138,20 @@ impl SeqFlashApp {
         match self.documents.open(path) {
             Ok(id) => {
                 self.active_document = Some(id);
+                // Detect FASTA/FASTQ format from the first few bytes.
+                let sample_end = self
+                    .documents
+                    .get(id)
+                    .map_or(0, |d| d.bytes().len().min(65536));
+                if let Some(doc) = self.documents.get_mut(id) {
+                    let format = detect_format(&doc.bytes()[..sample_end]);
+                    doc.set_format(format);
+                    tracing::info!(
+                        path = %path.display(),
+                        format = ?format,
+                        "detected format"
+                    );
+                }
                 self.record_recent(path.to_path_buf());
                 self.notice = None;
                 tracing::info!(path = %path.display(), "opened document");
@@ -177,9 +202,11 @@ impl SeqFlashApp {
         self.documents.close(id);
         // Drop the viewer (and its line index) for the closed document.
         self.viewers.remove(&id);
+        self.fasta_indexes.remove(&id);
         if was_active {
             self.active_document = self.documents.iter().next().map(Document::id);
             self.active_top_offset = 0;
+            self.current_record_number = None;
         }
     }
 
@@ -191,6 +218,102 @@ impl SeqFlashApp {
             .entry(id)
             .or_insert_with(|| RawTextViewer::new(file_size));
         self.viewers.get_mut(&id)
+    }
+
+    /// Borrow the FASTA index for `id`, creating it lazily.
+    pub(crate) fn index_for(&mut self, id: DocumentId) -> Option<&mut FastaIndex> {
+        let file_size = self.documents.get(id).map(|d| d.metadata().size)?;
+        self.fasta_indexes
+            .entry(id)
+            .or_insert_with(|| FastaIndex::new(file_size));
+        self.fasta_indexes.get_mut(&id)
+    }
+
+    /// Advance the background FASTA index scan for the active document.
+    fn advance_index_scan(&mut self) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        let Some(doc) = self.documents.get(id) else {
+            return;
+        };
+        let bytes = doc.bytes();
+        if let Some(idx) = self.fasta_indexes.get_mut(&id) {
+            idx.scan_chunk(bytes, seqflash_index::DEFAULT_INDEX_SCAN_BUDGET);
+        }
+    }
+
+    /// The currently selected record number (0-based), within the active
+    /// document. None if no document is open or no record is selected.
+    #[must_use]
+    pub(crate) fn current_record_number(&self) -> Option<u64> {
+        self.current_record_number
+    }
+
+    /// Select a record by number and scroll to it.
+    pub(crate) fn go_to_record(&mut self, record_number: u64) {
+        self.current_record_number = Some(record_number);
+        let Some(id) = self.active_document else {
+            return;
+        };
+        if let Some(idx) = self.fasta_indexes.get(&id) {
+            if record_number < idx.entries().len() as u64 {
+                let entry = &idx.entries()[usize::try_from(record_number).unwrap_or(usize::MAX)];
+                self.scroll_active_to_byte(entry.start_offset);
+            }
+        }
+    }
+
+    /// Select the next record.
+    pub(crate) fn next_record(&mut self) {
+        let n = self.current_record_number.unwrap_or(0);
+        self.go_to_record(n.saturating_add(1));
+    }
+
+    /// Select the previous record.
+    pub(crate) fn prev_record(&mut self) {
+        let n = self.current_record_number.unwrap_or(1);
+        self.go_to_record(n.saturating_sub(1));
+    }
+
+    /// Compute statistics for the given record's sequence bytes.
+    /// Returns None if the record doesn't exist or is not FASTA.
+    #[must_use]
+    pub(crate) fn record_stats(&self, id: DocumentId, rec: u64) -> Option<(BaseCounts, f64)> {
+        let doc = self.documents.get(id)?;
+        let idx = self.fasta_indexes.get(&id)?;
+        let entries = idx.entries();
+        let entry = entries.get(usize::try_from(rec).unwrap_or(usize::MAX))?;
+        let bytes = doc.bytes();
+        // Extract sequence bytes: skip past header line, strip newlines.
+        let hdr_end = entry.header_range.end;
+        let seq_start = usize::try_from(hdr_end + 1).unwrap_or(0); // skip past \n
+        let seq_end = usize::try_from(entry.end_offset)
+            .unwrap_or(bytes.len())
+            .min(bytes.len());
+        // Only consider FASTA format for stats.
+        if doc.format() != seqflash_types::SequenceFormat::Fasta {
+            return None;
+        }
+        if seq_start >= seq_end {
+            let counts = BaseCounts::default();
+            return Some((counts, 0.0));
+        }
+        let raw: Vec<u8> = bytes[seq_start..seq_end]
+            .iter()
+            .copied()
+            .filter(|&b| b != b'\n' && b != b'\r')
+            .collect();
+        let counts = count_bases(&raw);
+        let gc = gc_percent(&counts);
+        Some((counts, gc))
+    }
+
+    /// The active FastaIndex for UI read (immutable borrow).
+    #[must_use]
+    pub(crate) fn active_fasta_index(&self) -> Option<&FastaIndex> {
+        self.active_document
+            .and_then(|id| self.fasta_indexes.get(&id))
     }
 
     /// Scroll the active viewer to a byte offset (Home/End / "Go to offset").
@@ -303,6 +426,10 @@ impl eframe::App for SeqFlashApp {
         if let Some(path) = self.take_pending_open() {
             self.open_path(&path);
         }
+
+        // Advance the FASTA record index for the active document a little
+        // each frame (incremental, non-blocking).
+        self.advance_index_scan();
 
         // Handle files dragged onto the window. On Windows the backend fills
         // `DroppedFile.path` only (no inline bytes), so we open from disk.
