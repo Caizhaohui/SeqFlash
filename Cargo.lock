@@ -2816,6 +2816,7 @@ dependencies = [
 name = "seqflash-search"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "seqflash-types",
 ]
 

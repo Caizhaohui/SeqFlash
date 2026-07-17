@@ -51,6 +51,9 @@ directories = "6"
 # Large-file I/O
 memmap2 = "0.9"
 
+# Byte search
+memchr = "2"
+
 # Native file dialogs
 rfd = "0.15"
 
