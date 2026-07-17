@@ -8,6 +8,7 @@ use eframe::egui;
 
 use crate::app::SeqFlashApp;
 use seqflash_document::Document;
+use seqflash_ops::Transform;
 use seqflash_search::SearchMode;
 use seqflash_types::DocumentId;
 
@@ -505,6 +506,43 @@ fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
             }
         } else {
             ui.label("Stats unavailable.");
+        }
+    }
+
+    // ---- Operations ----
+    ui.separator();
+    ui.label(egui::RichText::new("Operations").strong());
+    ui.add_space(4.0);
+
+    // Copy buttons
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Copy Header").clicked() {
+            app.copy_current_header();
+        }
+        if ui.button("Copy Seq").clicked() {
+            app.copy_current_sequence();
+        }
+        if is_fastq && ui.button("Copy Qual").clicked() {
+            app.copy_current_quality();
+        }
+    });
+
+    // Export: Save As button
+    if ui.button("Save As…").clicked() {
+        let path = rfd::FileDialog::new()
+            .add_filter("FASTA", &["fa", "fasta"])
+            .add_filter("FASTQ", &["fq", "fastq"])
+            .add_filter("All files", &["*"])
+            .save_file();
+        if let Some(p) = path {
+            if let Err(msg) = app.export_current_record(rec, &p, Transform::None) {
+                // The app does not expose a direct notice setter from ui.rs,
+                // so we log the error and move on. The export function already
+                // cleans up temp files on failure.
+                tracing::warn!("export failed: {msg}");
+            } else {
+                tracing::info!("exported record {} to {}", rec + 1, p.display());
+            }
         }
     }
 }

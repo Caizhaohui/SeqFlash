@@ -14,7 +14,10 @@ mod stats;
 mod transform;
 
 pub use convert::fastq_to_fasta;
-pub use export::{export_fasta_records, export_fastq_records, ExportError, Transform};
+pub use export::{
+    export_fasta_records, export_fastq_records, ExportError, FastaExportRecord, FastqExportRecord,
+    Transform,
+};
 pub use fastq_stats::{phred33_quality_stats, QualityStats};
 pub use filter::{extract_by_id, filter_by_length};
 pub use stats::{count_bases, gc_percent, BaseCounts};
