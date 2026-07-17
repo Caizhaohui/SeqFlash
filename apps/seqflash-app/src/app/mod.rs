@@ -17,8 +17,9 @@ use seqflash_document::{Document, DocumentList};
 use seqflash_formats::detect_format;
 use seqflash_index::{FastaIndex, FastqIndex};
 use seqflash_ops::{count_bases, gc_percent, phred33_quality_stats, BaseCounts, QualityStats};
+use seqflash_search::{SearchMode, SearchSession};
 use seqflash_settings::AppSettings;
-use seqflash_types::DocumentId;
+use seqflash_types::{ByteRange, DocumentId};
 use seqflash_viewer::RawTextViewer;
 
 /// Maximum number of entries kept in the in-memory recent-files list.
@@ -55,6 +56,14 @@ pub(crate) struct SeqFlashApp {
     show_goto_offset: bool,
     /// Current text in the "Go to offset" input.
     goto_offset_input: String,
+    /// One search session per open document (if a search was started).
+    search_sessions: HashMap<DocumentId, SearchSession>,
+    /// Search input text (shared across documents).
+    search_input: String,
+    /// Selected search mode.
+    search_mode: SearchMode,
+    /// Currently selected search result index (for prev/next navigation).
+    current_search_result: Option<usize>,
 }
 
 impl SeqFlashApp {
@@ -76,6 +85,10 @@ impl SeqFlashApp {
             pending_clipboard: None,
             show_goto_offset: false,
             goto_offset_input: String::new(),
+            search_sessions: HashMap::new(),
+            search_input: String::new(),
+            search_mode: SearchMode::RawBytes,
+            current_search_result: None,
         };
         if let Some(path) = initial_file {
             app.open_path(&path);
@@ -207,6 +220,7 @@ impl SeqFlashApp {
         self.viewers.remove(&id);
         self.fasta_indexes.remove(&id);
         self.fastq_indexes.remove(&id);
+        self.search_sessions.remove(&id);
         if was_active {
             self.active_document = self.documents.iter().next().map(Document::id);
             self.active_top_offset = 0;
@@ -390,6 +404,190 @@ impl SeqFlashApp {
         self.active_top_offset = offset;
     }
 
+    // ---- Search ----
+
+    /// Borrow the search input text (mutably, for the UI text field).
+    pub(crate) fn search_input_mut(&mut self) -> &mut String {
+        &mut self.search_input
+    }
+
+    /// Read-only access to search input.
+    #[must_use]
+    pub(crate) fn search_input(&self) -> &str {
+        &self.search_input
+    }
+
+    /// Set the current search mode.
+    pub(crate) fn set_search_mode(&mut self, mode: SearchMode) {
+        self.search_mode = mode;
+    }
+
+    /// Get the current search mode.
+    #[must_use]
+    pub(crate) fn search_mode(&self) -> SearchMode {
+        self.search_mode
+    }
+
+    /// Start a new search on the active document with the current input/mode.
+    pub(crate) fn start_search(&mut self) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        let Some(doc) = self.documents.get(id) else {
+            return;
+        };
+        let file_size = doc.metadata().size;
+        let pattern = self.search_input.as_bytes().to_vec();
+        let mode = self.search_mode;
+        let mut session = match mode {
+            SearchMode::FromPosition => {
+                SearchSession::from_offset(mode, pattern, true, self.active_top_offset, file_size)
+            }
+            _ => SearchSession::new(mode, pattern, true, file_size),
+        };
+
+        // For ID search, run against the index immediately.
+        if matches!(mode, SearchMode::RecordIdExact | SearchMode::RecordIdPrefix) {
+            if let Some(fasta_idx) = self.fasta_indexes.get(&id) {
+                let doc_bytes = doc.bytes();
+                let entries = fasta_idx.entries();
+                session.search_ids(entries.len(), |i| {
+                    let e = &entries[i];
+                    let s = usize::try_from(e.id_range.start)
+                        .unwrap_or(0)
+                        .min(doc_bytes.len());
+                    let en = usize::try_from(e.id_range.end)
+                        .unwrap_or(s)
+                        .min(doc_bytes.len());
+                    doc_bytes[s..en].to_vec()
+                });
+            }
+        }
+
+        self.search_sessions.insert(id, session);
+        self.current_search_result = None;
+    }
+
+    /// Advance the active search session by one chunk (called each frame).
+    fn advance_search(&mut self) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        let Some(doc) = self.documents.get(id) else {
+            return;
+        };
+        let bytes = doc.bytes();
+        if let Some(session) = self.search_sessions.get_mut(&id) {
+            if !session.is_complete() && !session.is_cancelled() {
+                session.search_chunk(bytes, 4 * 1024 * 1024);
+            }
+        }
+    }
+
+    /// Cancel the active search.
+    pub(crate) fn cancel_search(&mut self) {
+        if let Some(id) = self.active_document {
+            if let Some(session) = self.search_sessions.get_mut(&id) {
+                session.cancel();
+            }
+        }
+    }
+
+    /// Get search results for the active document (pre-collected to avoid
+    /// borrow conflicts with click handlers).
+    pub(crate) fn search_results_snapshot(&self) -> Vec<(ByteRange, Option<u64>, String)> {
+        let Some(id) = self.active_document else {
+            return Vec::new();
+        };
+        let Some(session) = self.search_sessions.get(&id) else {
+            return Vec::new();
+        };
+        session
+            .results()
+            .iter()
+            .map(|r| {
+                let preview = String::from_utf8_lossy(&r.preview)
+                    .chars()
+                    .take(60)
+                    .collect();
+                (r.byte_range, r.record_number, preview)
+            })
+            .collect()
+    }
+
+    /// Whether the active search is still running.
+    #[must_use]
+    pub(crate) fn search_is_running(&self) -> bool {
+        self.active_document
+            .and_then(|id| self.search_sessions.get(&id))
+            .is_some_and(|s| !s.is_complete() && !s.is_cancelled())
+    }
+
+    /// Search progress percentage (0-100).
+    #[must_use]
+    pub(crate) fn search_progress_pct(&self) -> u8 {
+        let Some(id) = self.active_document else {
+            return 0;
+        };
+        let Some(session) = self.search_sessions.get(&id) else {
+            return 0;
+        };
+        let file_size = self.active_file_size().max(1);
+        u8::try_from(session.scan_progress() * 100 / file_size).unwrap_or(0)
+    }
+
+    /// Navigate to the next search result.
+    pub(crate) fn next_search_result(&mut self) {
+        let results = self.search_results_snapshot();
+        if results.is_empty() {
+            return;
+        }
+        let idx = self.current_search_result.unwrap_or(0);
+        let next = (idx + 1).min(results.len() - 1);
+        self.current_search_result = Some(next);
+        self.scroll_active_to_byte(results[next].0.start);
+    }
+
+    /// Navigate to the previous search result.
+    pub(crate) fn prev_search_result(&mut self) {
+        let results = self.search_results_snapshot();
+        if results.is_empty() {
+            return;
+        }
+        let idx = self.current_search_result.unwrap_or(0);
+        let prev = idx.saturating_sub(1);
+        self.current_search_result = Some(prev);
+        self.scroll_active_to_byte(results[prev].0.start);
+    }
+
+    /// Navigate to a specific search result by index.
+    pub(crate) fn goto_search_result(&mut self, index: usize) {
+        let results = self.search_results_snapshot();
+        if index < results.len() {
+            self.current_search_result = Some(index);
+            self.scroll_active_to_byte(results[index].0.start);
+        }
+    }
+
+    /// Highlight ranges for the active search (for the viewer).
+    #[allow(dead_code)] // viewer highlight integration is a refinement
+    #[must_use]
+    pub(crate) fn search_highlights(&self) -> Vec<ByteRange> {
+        let Some(id) = self.active_document else {
+            return Vec::new();
+        };
+        let Some(session) = self.search_sessions.get(&id) else {
+            return Vec::new();
+        };
+        session.results().iter().map(|r| r.byte_range).collect()
+    }
+
+    /// Index of the currently selected search result.
+    #[must_use]
+    pub(crate) fn current_search_result_index(&self) -> Option<usize> {
+        self.current_search_result
+    }
+
     /// Drain any text staged for clipboard copy.
     pub(crate) fn take_pending_clipboard(&mut self) -> Option<String> {
         self.pending_clipboard.take()
@@ -484,6 +682,7 @@ impl eframe::App for SeqFlashApp {
         // Advance the FASTA record index for the active document a little
         // each frame (incremental, non-blocking).
         self.advance_index_scan();
+        self.advance_search();
 
         // Handle files dragged onto the window. On Windows the backend fills
         // `DroppedFile.path` only (no inline bytes), so we open from disk.

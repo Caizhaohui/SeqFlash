@@ -28,6 +28,7 @@ seqflash-document = { workspace = true }
 seqflash-formats = { workspace = true }
 seqflash-index = { workspace = true }
 seqflash-ops = { workspace = true }
+seqflash-search = { workspace = true }
 seqflash-types = { workspace = true }
 seqflash-viewer = { workspace = true }
 seqflash-settings = { workspace = true }

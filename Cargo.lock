@@ -2755,6 +2755,7 @@ dependencies = [
  "seqflash-formats",
  "seqflash-index",
  "seqflash-ops",
+ "seqflash-search",
  "seqflash-settings",
  "seqflash-types",
  "seqflash-viewer",

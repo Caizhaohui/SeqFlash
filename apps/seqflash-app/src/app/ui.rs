@@ -8,6 +8,7 @@ use eframe::egui;
 
 use crate::app::SeqFlashApp;
 use seqflash_document::Document;
+use seqflash_search::SearchMode;
 use seqflash_types::DocumentId;
 
 /// Render the whole window for one frame.
@@ -174,11 +175,16 @@ fn empty_state(ui: &mut egui::Ui) {
 
 /// Left panel: record list, search, prev/next, jump-to-record.
 const LIST_LIMIT: usize = 500;
+const SEARCH_LIST_LIMIT: usize = 200;
 type IndexMeta = Option<(usize, bool, u8, Vec<(String, bool)>)>;
 
 #[allow(clippy::too_many_lines)]
 fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.heading("Records");
+    ui.add_space(4.0);
+
+    // ---- Search bar ----
+    search_bar(app, ui);
     ui.add_space(4.0);
 
     let Some(doc_id) = app.active_document_id() else {
@@ -322,6 +328,110 @@ fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
         ));
     }
 }
+
+/// Search input + mode selector + results navigation.
+fn search_bar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("Search").strong());
+    // Mode selector (individual buttons for compactness)
+    let current_mode = app.search_mode();
+    ui.horizontal_wrapped(|ui| {
+        for (mode, label) in SEARCH_MODES {
+            if ui.selectable_label(current_mode == *mode, *label).clicked() {
+                app.set_search_mode(*mode);
+            }
+        }
+    });
+
+    // Search input + buttons
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(app.search_input_mut())
+                .hint_text("pattern…")
+                .desired_width(120.0),
+        );
+        if resp.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && !app.search_input_mut().is_empty()
+        {
+            app.start_search();
+        }
+        if ui.button("🔍").clicked() && !app.search_input().is_empty() {
+            app.start_search();
+        }
+    });
+
+    // Results summary + navigation
+    let results = app.search_results_snapshot();
+    if !results.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label(format!("{} hits", results.len()));
+            if ui.button("◀").on_hover_text("Prev result").clicked() {
+                app.prev_search_result();
+            }
+            if ui.button("▶").on_hover_text("Next result").clicked() {
+                app.next_search_result();
+            }
+            if app.search_is_running() && ui.button("Cancel").clicked() {
+                app.cancel_search();
+            }
+        });
+
+        // Results list (limited)
+        let shown = results.len().min(SEARCH_LIST_LIMIT);
+        let current = app.current_search_result_index();
+        egui::ScrollArea::vertical()
+            .id_salt("search_results")
+            .max_height(150.0)
+            .show(ui, |ui| {
+                for (i, (range, rec, preview)) in results.iter().take(shown).enumerate() {
+                    let is_current = current == Some(i);
+                    let label = format!(
+                        "@{} {}",
+                        range.start,
+                        if preview.is_empty() { "" } else { preview }
+                    );
+                    let rich = if is_current {
+                        egui::RichText::new(&label).color(egui::Color32::YELLOW)
+                    } else {
+                        egui::RichText::new(&label)
+                    };
+                    let rec_info = rec.map_or(String::new(), |r| format!("rec {r}"));
+                    let resp = ui.selectable_label(is_current, rich);
+                    if resp.clicked() {
+                        app.goto_search_result(i);
+                    }
+                    if !rec_info.is_empty() {
+                        ui.label(egui::RichText::new(&rec_info).weak().small());
+                    }
+                }
+            });
+        if results.len() > SEARCH_LIST_LIMIT {
+            ui.label(
+                egui::RichText::new(format!(
+                    "… showing first {SEARCH_LIST_LIMIT} of {}",
+                    results.len()
+                ))
+                .weak()
+                .small(),
+            );
+        }
+    } else if app.search_is_running() {
+        let pct = app.search_progress_pct();
+        ui.label(format!("Searching… {pct}%"));
+        if ui.button("Cancel").clicked() {
+            app.cancel_search();
+        }
+    }
+}
+
+const SEARCH_MODES: &[(SearchMode, &str)] = &[
+    (SearchMode::RawBytes, "Bytes"),
+    (SearchMode::RecordIdExact, "ID"),
+    (SearchMode::RecordIdPrefix, "ID*"),
+    (SearchMode::SequenceFragment, "Seq"),
+    (SearchMode::CurrentRecord, "Rec"),
+    (SearchMode::FromPosition, "Pos"),
+];
 
 /// Right panel: record statistics.
 fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
