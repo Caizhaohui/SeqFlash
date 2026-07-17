@@ -1,0 +1,26 @@
+[package]
+name = "seqflash-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Stdin fuzz harnesses for SeqFlash parsers (M8)"
+
+[lints]
+workspace = true
+
+[dependencies]
+seqflash-formats = { workspace = true }
+
+[[bin]]
+name = "fuzz_detect"
+path = "src/fuzz_detect.rs"
+
+[[bin]]
+name = "fuzz_fastq"
+path = "src/fuzz_fastq.rs"
+
+[[bin]]
+name = "fuzz_fasta_header"
+path = "src/fuzz_fasta_header.rs"

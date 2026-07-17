@@ -23,7 +23,8 @@ pub use fastq_stats::{phred33_quality_stats, QualityStats};
 pub use filter::{extract_by_id, filter_by_length};
 pub use overlay::{EditOverlay, RecordEdit, RECORD_EDIT_LIMIT_BYTES};
 pub use overlay_export::{
-    save_fasta_with_overlay, save_fastq_with_overlay, FastaOverlayEntry, FastqOverlayEntry,
+    save_fasta_with_overlay, save_fasta_with_overlay_ex, save_fastq_with_overlay,
+    save_fastq_with_overlay_ex, FastaOverlayEntry, FastqOverlayEntry,
 };
 pub use stats::{count_bases, gc_percent, BaseCounts};
 pub use transform::{

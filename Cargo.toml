@@ -17,6 +17,8 @@ members = [
     "crates/seqflash-ops",
     "crates/seqflash-jobs",
     "crates/seqflash-platform-windows",
+    "benches/seqflash-bench",
+    "fuzz/seqflash-fuzz",
 ]
 
 [workspace.package]
@@ -56,6 +58,10 @@ memchr = "2"
 
 # Native file dialogs
 rfd = "0.15"
+
+# Testing / benchmarks (M8)
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
 
 # Internal crates.
 seqflash-types = { path = "crates/seqflash-types" }

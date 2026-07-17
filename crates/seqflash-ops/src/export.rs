@@ -36,6 +36,9 @@ pub enum ExportError {
     Write(io::Error),
     #[error("failed to rename temporary file to target: {0}")]
     Rename(io::Error),
+    /// User cancelled a long-running export/save (temp file already cleaned up).
+    #[error("export cancelled")]
+    Cancelled,
 }
 
 /// One FASTA record to export (sliced from the source file's index).

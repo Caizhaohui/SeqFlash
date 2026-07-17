@@ -14,6 +14,8 @@ use seqflash_types::DocumentId;
 
 /// Render the whole window for one frame.
 pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    handle_edit_shortcuts(app, ctx);
+
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         toolbar(app, ui);
     });
@@ -47,6 +49,14 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
     egui::CentralPanel::default().show(ctx, |ui| {
         let active_id = app.active_document_id();
         if let Some(doc_id) = active_id {
+            // Overlay-resolved preview for the selected record (delete/replace/insert).
+            overlay_preview_panel(app, ui);
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Source (read-only mmap — pre-overlay bytes)")
+                    .weak()
+                    .small(),
+            );
             app.viewer_for(doc_id);
             let mut viewer = app.viewers.remove(&doc_id);
             let bytes = app.documents.get(doc_id).map_or(&[][..], Document::bytes);
@@ -68,6 +78,46 @@ pub(crate) fn draw(app: &mut SeqFlashApp, ctx: &egui::Context) {
     }
     if app.show_goto_offset() {
         goto_offset_dialog(app, ctx);
+    }
+    if app.show_edit_header() {
+        edit_header_dialog(app, ctx);
+    }
+    if app.show_edit_seq() {
+        edit_seq_dialog(app, ctx);
+    }
+    if app.show_edit_qual() {
+        edit_qual_dialog(app, ctx);
+    }
+    if app.show_insert() {
+        insert_record_dialog(app, ctx);
+    }
+    if app.save_in_progress() {
+        save_progress_panel(app, ctx);
+    }
+}
+
+/// Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) for overlay undo/redo.
+fn handle_edit_shortcuts(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    // Skip while a modal text dialog is open so Ctrl+Z edits the text field.
+    if app.show_edit_header()
+        || app.show_edit_seq()
+        || app.show_edit_qual()
+        || app.show_insert()
+        || app.show_goto_offset()
+    {
+        return;
+    }
+    let (undo, redo) = ctx.input(|i| {
+        let ctrl = i.modifiers.command;
+        let undo = ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
+        let redo = ctrl
+            && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)));
+        (undo, redo)
+    });
+    if undo {
+        app.undo_edit();
+    } else if redo {
+        app.redo_edit();
     }
 }
 
@@ -100,7 +150,7 @@ fn goto_offset_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
     }
 }
 
-/// Toolbar: Open / Go to offset / Copy visible / Check source + drag hint.
+/// Toolbar: Open / Go to offset / Copy visible / Check source / Undo-Redo / Save edits.
 fn toolbar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         if ui.button("Open…").clicked() {
@@ -116,6 +166,36 @@ fn toolbar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
             if ui.button("Check source").clicked() {
                 app.check_active_source();
             }
+            ui.separator();
+            let can_undo = app.can_undo();
+            let can_redo = app.can_redo();
+            if ui
+                .add_enabled(can_undo, egui::Button::new("Undo"))
+                .on_hover_text("Ctrl+Z")
+                .clicked()
+            {
+                app.undo_edit();
+            }
+            if ui
+                .add_enabled(can_redo, egui::Button::new("Redo"))
+                .on_hover_text("Ctrl+Y")
+                .clicked()
+            {
+                app.redo_edit();
+            }
+            let can_save = app.active_is_dirty() && !app.save_in_progress();
+            if ui
+                .add_enabled(can_save, egui::Button::new("Save edits…"))
+                .on_hover_text(
+                    "Write a new file with overlay edits applied (never overwrites source)",
+                )
+                .clicked()
+            {
+                save_edits_dialog(app, ui.ctx());
+            }
+            if app.save_in_progress() && ui.button("Cancel save").clicked() {
+                app.cancel_save();
+            }
         }
         ui.separator();
         ui.label(
@@ -128,6 +208,50 @@ fn toolbar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Native save dialog for overlay-aware full-file export (starts a background job).
+fn save_edits_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let path = rfd::FileDialog::new()
+        .add_filter("FASTA", &["fa", "fasta", "fna"])
+        .add_filter("FASTQ", &["fq", "fastq"])
+        .add_filter("All files", &["*"])
+        .save_file();
+    if let Some(p) = path {
+        if let Err(msg) = app.start_save_with_overlay(&p, ctx) {
+            tracing::warn!("overlay save failed to start: {msg}");
+            app.set_notice(msg);
+        }
+    }
+}
+
+/// Floating progress window for the background overlay save.
+fn save_progress_panel(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let (done, total) = app.save_progress().unwrap_or((0, 0));
+    let frac = if total == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            done as f32 / total as f32
+        }
+    };
+    egui::Window::new("Saving…")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(format!("Writing record {done} / {total}"));
+            ui.add(egui::ProgressBar::new(frac).show_percentage());
+            if ui.button("Cancel").clicked() {
+                app.cancel_save();
+            }
+            ui.label(
+                egui::RichText::new("Source file is never modified. Cancel deletes the temp file.")
+                    .weak()
+                    .small(),
+            );
+        });
+}
+
 /// One tab per open document, plus a close button on each.
 fn tab_strip(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     // Collect tabs up front so we don't hold a borrow of `app` while the
@@ -135,7 +259,13 @@ fn tab_strip(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     let entries: Vec<(DocumentId, String)> = app
         .document_entries()
         .into_iter()
-        .map(|(id, path, _size)| (id, tab_label(&path)))
+        .map(|(id, path, _size)| {
+            let mut label = tab_label(&path);
+            if app.document_is_dirty(id) {
+                label.push('*');
+            }
+            (id, label)
+        })
         .collect();
 
     ui.horizontal_wrapped(|ui| {
@@ -299,20 +429,35 @@ fn record_nav_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     let shown = rec_entries.len().min(LIST_LIMIT);
     let current = app.current_record_number();
     // Rec_entries already has pre-computed (label, is_error) pairs.
-    // Build (index, is_active, label, is_error) for the closure.
-    let display_items: Vec<(usize, bool, String, bool)> = rec_entries
+    // Append overlay badges (DEL / EDIT / +B / +A).
+    let display_items: Vec<(usize, bool, String, bool, bool)> = rec_entries
         .iter()
         .take(shown)
         .enumerate()
-        .map(|(i, (label, is_error))| (i, current == Some(i as u64), label.clone(), *is_error))
+        .map(|(i, (label, is_error))| {
+            let flags = app.record_edit_flags(doc_id, i as u64);
+            let mut text = label.clone();
+            if let Some(badge) = flags.badge() {
+                text.push(' ');
+                text.push_str(&badge);
+            }
+            (i, current == Some(i as u64), text, *is_error, flags.deleted)
+        })
         .collect();
 
     egui::ScrollArea::vertical()
         .id_salt("rec_list")
         .show(ui, |ui| {
-            for (idx, is_current, label, is_error) in &display_items {
-                let rich = if *is_error {
+            for (idx, is_current, label, is_error, is_deleted) in &display_items {
+                let rich = if *is_deleted {
+                    egui::RichText::new(label.as_str())
+                        .color(egui::Color32::from_rgb(220, 80, 80))
+                        .strikethrough()
+                } else if *is_error {
                     egui::RichText::new(label.as_str()).color(egui::Color32::RED)
+                } else if label.contains("[EDIT") || label.contains("[+B") || label.contains("[+A")
+                {
+                    egui::RichText::new(label.as_str()).color(egui::Color32::from_rgb(220, 160, 40))
                 } else {
                     egui::RichText::new(label.as_str())
                 };
@@ -434,7 +579,7 @@ const SEARCH_MODES: &[(SearchMode, &str)] = &[
     (SearchMode::FromPosition, "Pos"),
 ];
 
-/// Right panel: record statistics.
+/// Right panel: record statistics + operations.
 fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.heading("Record Info");
     ui.add_space(4.0);
@@ -447,11 +592,33 @@ fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
         ui.label("Click a record to view stats.");
         return;
     };
-    let doc = app.active_document();
-    let is_fastq = doc.is_some_and(|d| d.format() == seqflash_types::SequenceFormat::Fastq);
+    let is_fastq = app
+        .active_document()
+        .is_some_and(|d| d.format() == seqflash_types::SequenceFormat::Fastq);
+
+    overlay_status_section(app, ui);
+    record_field_preview_section(app, ui);
+    record_stats_section(app, ui, doc_id, rec, is_fastq);
+    record_operations_section(app, ui, rec, is_fastq);
+}
+
+fn record_stats_section(
+    app: &SeqFlashApp,
+    ui: &mut egui::Ui,
+    doc_id: DocumentId,
+    rec: u64,
+    is_fastq: bool,
+) {
+    if app.record_edit_flags(doc_id, rec).deleted {
+        ui.label(
+            egui::RichText::new("Stats: n/a (deleted in overlay)")
+                .weak()
+                .italics(),
+        );
+        return;
+    }
 
     if is_fastq {
-        // Quality stats for FASTQ.
         if let Some(qs) = app.fastq_quality_for(doc_id, rec) {
             ui.label(format!("Record #: {}", rec + 1));
             ui.label(format!("Length: {}", qs.total));
@@ -476,45 +643,180 @@ fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
             } else {
                 ui.label("Low qual (<Q20): none");
             }
+            if app.record_edit_flags(doc_id, rec).replaced {
+                ui.label(egui::RichText::new("(stats from overlay)").weak().small());
+            }
         } else {
             ui.label("Quality stats unavailable.");
         }
-    } else {
-        // Base-count stats for FASTA.
-        if let Some((counts, gc)) = app.record_stats(doc_id, rec) {
-            ui.label(format!("Record #: {}", rec + 1));
-            ui.label(format!("Length: {} bases", counts.total()));
-            ui.label(format!("GC: {gc:.1}%"));
-            ui.separator();
-            ui.label(format!("A: {}", counts.a));
-            ui.label(format!("C: {}", counts.c));
-            ui.label(format!("G: {}", counts.g));
-            ui.label(format!("T: {}", counts.t));
-            if counts.u > 0 {
-                ui.label(format!("U: {}", counts.u));
-            }
-            ui.label(format!("N: {}", counts.n));
-            ui.label(format!("Other (IUPAC/gap): {}", counts.other));
-            if counts.illegal > 0 {
-                ui.label(
-                    egui::RichText::new(format!("Illegal chars: {}", counts.illegal))
-                        .color(egui::Color32::RED),
-                );
-            }
-            if counts.a + counts.c + counts.g + counts.t + counts.u == 0 {
-                ui.label("Empty sequence");
-            }
-        } else {
-            ui.label("Stats unavailable.");
-        }
+        return;
     }
 
-    // ---- Operations ----
+    if let Some((counts, gc)) = app.record_stats(doc_id, rec) {
+        ui.label(format!("Record #: {}", rec + 1));
+        ui.label(format!("Length: {} bases", counts.total()));
+        ui.label(format!("GC: {gc:.1}%"));
+        ui.separator();
+        ui.label(format!("A: {}", counts.a));
+        ui.label(format!("C: {}", counts.c));
+        ui.label(format!("G: {}", counts.g));
+        ui.label(format!("T: {}", counts.t));
+        if counts.u > 0 {
+            ui.label(format!("U: {}", counts.u));
+        }
+        ui.label(format!("N: {}", counts.n));
+        ui.label(format!("Other (IUPAC/gap): {}", counts.other));
+        if counts.illegal > 0 {
+            ui.label(
+                egui::RichText::new(format!("Illegal chars: {}", counts.illegal))
+                    .color(egui::Color32::RED),
+            );
+        }
+        if counts.a + counts.c + counts.g + counts.t + counts.u == 0 {
+            ui.label("Empty sequence");
+        }
+        if app.record_edit_flags(doc_id, rec).replaced {
+            ui.label(egui::RichText::new("(stats from overlay)").weak().small());
+        }
+    } else {
+        ui.label("Stats unavailable.");
+    }
+}
+
+fn overlay_status_section(app: &SeqFlashApp, ui: &mut egui::Ui) {
+    let flags = app.current_record_edit_flags();
+    if flags.deleted {
+        ui.label(
+            egui::RichText::new("Status: DELETED (pending save)")
+                .color(egui::Color32::from_rgb(220, 80, 80))
+                .strong(),
+        );
+    } else if flags.replaced {
+        ui.label(
+            egui::RichText::new("Status: EDITED (overlay)")
+                .color(egui::Color32::from_rgb(220, 160, 40))
+                .strong(),
+        );
+    }
+    if flags.inserts_before > 0 || flags.inserts_after > 0 {
+        ui.label(
+            egui::RichText::new(format!(
+                "Inserts: {} before, {} after",
+                flags.inserts_before, flags.inserts_after
+            ))
+            .color(egui::Color32::from_rgb(100, 180, 100)),
+        );
+    }
+    if app.active_is_dirty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "Unsaved edits: {} record(s)",
+                app.active_edit_count()
+            ))
+            .color(egui::Color32::from_rgb(220, 160, 40)),
+        );
+    }
+    if flags.has_any() || app.active_is_dirty() {
+        ui.separator();
+    }
+}
+
+/// Compact header/seq preview in the right panel (overlay-aware).
+fn record_field_preview_section(app: &SeqFlashApp, ui: &mut egui::Ui) {
+    let Some(preview) = app.current_overlay_preview() else {
+        return;
+    };
+    if let Some(h) = &preview.header {
+        ui.label(egui::RichText::new("Header (effective)").strong().small());
+        ui.label(egui::RichText::new(h).monospace().small());
+    }
+    if let Some(s) = &preview.sequence {
+        ui.label(egui::RichText::new("Sequence (effective)").strong().small());
+        ui.label(egui::RichText::new(s).monospace().small());
+    }
+    if let Some(q) = &preview.quality {
+        ui.label(egui::RichText::new("Quality (effective)").strong().small());
+        ui.label(egui::RichText::new(q).monospace().small());
+    }
+    ui.separator();
+}
+
+/// Central-panel overlay preview: effective record body + inserts.
+fn overlay_preview_panel(app: &SeqFlashApp, ui: &mut egui::Ui) {
+    let Some(preview) = app.current_overlay_preview() else {
+        ui.label(
+            egui::RichText::new("Select a record to preview effective (overlay) content.")
+                .weak()
+                .small(),
+        );
+        return;
+    };
+
+    let title = if preview.flags.has_any() {
+        "Overlay preview (what Save edits will write for this record)"
+    } else {
+        "Record preview (no overlay edits)"
+    };
+
+    egui::CollapsingHeader::new(title)
+        .default_open(preview.flags.has_any())
+        .show(ui, |ui| {
+            if preview.flags.deleted {
+                ui.label(
+                    egui::RichText::new(&preview.body_preview)
+                        .color(egui::Color32::from_rgb(220, 80, 80))
+                        .strong(),
+                );
+            }
+
+            for (i, text) in preview.inserts_before.iter().enumerate() {
+                ui.label(
+                    egui::RichText::new(format!("▸ Insert before #{}\n{text}", i + 1))
+                        .color(egui::Color32::from_rgb(100, 180, 100))
+                        .monospace(),
+                );
+                ui.separator();
+            }
+
+            if !preview.flags.deleted {
+                let color = if preview.flags.replaced {
+                    egui::Color32::from_rgb(240, 200, 120)
+                } else {
+                    ui.visuals().text_color()
+                };
+                ui.label(
+                    egui::RichText::new(&preview.body_preview)
+                        .monospace()
+                        .color(color),
+                );
+            }
+
+            for (i, text) in preview.inserts_after.iter().enumerate() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("▸ Insert after #{}\n{text}", i + 1))
+                        .color(egui::Color32::from_rgb(100, 180, 100))
+                        .monospace(),
+                );
+            }
+
+            if !preview.flags.has_any() {
+                ui.label(
+                    egui::RichText::new(
+                        "Edits appear here immediately. Source view below stays read-only.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
+        });
+}
+
+fn record_operations_section(app: &mut SeqFlashApp, ui: &mut egui::Ui, rec: u64, is_fastq: bool) {
     ui.separator();
     ui.label(egui::RichText::new("Operations").strong());
     ui.add_space(4.0);
 
-    // Copy buttons
     ui.horizontal_wrapped(|ui| {
         if ui.button("Copy Header").clicked() {
             app.copy_current_header();
@@ -527,8 +829,47 @@ fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
         }
     });
 
-    // Export: Save As button
-    if ui.button("Save As…").clicked() {
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Edit Header…").clicked() {
+            app.open_edit_header_dialog();
+        }
+        if ui.button("Edit Seq…").clicked() {
+            app.open_edit_seq_dialog();
+        }
+        if is_fastq && ui.button("Edit Qual…").clicked() {
+            app.open_edit_qual_dialog();
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("Delete record")
+            .on_hover_text("Mark deleted in overlay; source file is not modified")
+            .clicked()
+        {
+            app.delete_current_record();
+        }
+        if ui
+            .button("Insert…")
+            .on_hover_text("Insert a new record before or after the current one")
+            .clicked()
+        {
+            app.open_insert_dialog(true);
+        }
+        if ui
+            .add_enabled(app.can_undo(), egui::Button::new("Undo"))
+            .clicked()
+        {
+            app.undo_edit();
+        }
+        if ui
+            .add_enabled(app.can_redo(), egui::Button::new("Redo"))
+            .clicked()
+        {
+            app.redo_edit();
+        }
+    });
+
+    if ui.button("Export record…").clicked() {
         let path = rfd::FileDialog::new()
             .add_filter("FASTA", &["fa", "fasta"])
             .add_filter("FASTQ", &["fq", "fastq"])
@@ -536,22 +877,227 @@ fn info_panel(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
             .save_file();
         if let Some(p) = path {
             if let Err(msg) = app.export_current_record(rec, &p, Transform::None) {
-                // The app does not expose a direct notice setter from ui.rs,
-                // so we log the error and move on. The export function already
-                // cleans up temp files on failure.
                 tracing::warn!("export failed: {msg}");
+                app.set_notice(msg);
             } else {
                 tracing::info!("exported record {} to {}", rec + 1, p.display());
+                app.set_notice(format!("Exported record {} to {}.", rec + 1, p.display()));
             }
         }
     }
+
+    let can_save = app.active_is_dirty() && !app.save_in_progress();
+    if ui
+        .add_enabled(can_save, egui::Button::new("Save edits…"))
+        .on_hover_text("Write a new file applying all overlay edits (background, cancellable)")
+        .clicked()
+    {
+        save_edits_dialog(app, ui.ctx());
+    }
 }
 
-/// Bottom status bar: path, size, format, record count, offset.
+/// Modal dialog: insert a new record before/after the current one.
+fn insert_record_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let mut open = true;
+    let is_fastq = app
+        .active_document()
+        .is_some_and(|d| d.format() == seqflash_types::SequenceFormat::Fastq);
+    let title = if app.insert_before() {
+        "Insert record before"
+    } else {
+        "Insert record after"
+    };
+    egui::Window::new(title)
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_width(480.0)
+        .default_height(360.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(app.insert_before(), "Before current")
+                    .clicked()
+                {
+                    app.set_insert_before(true);
+                }
+                if ui
+                    .selectable_label(!app.insert_before(), "After current")
+                    .clicked()
+                {
+                    app.set_insert_before(false);
+                }
+            });
+            ui.separator();
+            ui.label("Header (without leading > or @):");
+            ui.add(
+                egui::TextEdit::singleline(app.edit_header_input_mut())
+                    .desired_width(f32::INFINITY)
+                    .hint_text("new_record"),
+            );
+            ui.label("Sequence:");
+            egui::ScrollArea::vertical()
+                .id_salt("insert_seq")
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(app.edit_seq_input_mut())
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(6)
+                            .code_editor(),
+                    );
+                });
+            if is_fastq {
+                ui.label("Quality (Phred+33; length must match sequence):");
+                egui::ScrollArea::vertical()
+                    .id_salt("insert_qual")
+                    .max_height(80.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(app.edit_qual_input_mut())
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4)
+                                .code_editor(),
+                        );
+                    });
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Insert").clicked() {
+                    app.close_insert_dialog(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    app.close_insert_dialog(false);
+                }
+            });
+            ui.label(
+                egui::RichText::new("Insert is stored in the overlay until Save edits…")
+                    .weak()
+                    .small(),
+            );
+        });
+    if !open {
+        app.close_insert_dialog(false);
+    }
+}
+
+/// Modal dialog: edit the current record header.
+fn edit_header_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let mut open = true;
+    egui::Window::new("Edit header")
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_width(420.0)
+        .show(ctx, |ui| {
+            ui.label("Header (without leading > or @):");
+            ui.add(
+                egui::TextEdit::singleline(app.edit_header_input_mut())
+                    .desired_width(f32::INFINITY)
+                    .hint_text("record id and description"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    app.close_edit_header_dialog(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    app.close_edit_header_dialog(false);
+                }
+            });
+            ui.label(
+                egui::RichText::new("Changes stay in memory until you use Save edits…")
+                    .weak()
+                    .small(),
+            );
+        });
+    if !open {
+        app.close_edit_header_dialog(false);
+    }
+}
+
+/// Modal dialog: edit the current record sequence.
+fn edit_seq_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let mut open = true;
+    egui::Window::new("Edit sequence")
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_width(480.0)
+        .default_height(280.0)
+        .show(ctx, |ui| {
+            ui.label("Sequence bases (whitespace ignored on apply):");
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(app.edit_seq_input_mut())
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(10)
+                            .code_editor(),
+                    );
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    app.close_edit_seq_dialog(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    app.close_edit_seq_dialog(false);
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "For FASTQ, sequence and quality lengths must match after edit.",
+                )
+                .weak()
+                .small(),
+            );
+        });
+    if !open {
+        app.close_edit_seq_dialog(false);
+    }
+}
+
+/// Modal dialog: edit the current FASTQ quality string.
+fn edit_qual_dialog(app: &mut SeqFlashApp, ctx: &egui::Context) {
+    let mut open = true;
+    egui::Window::new("Edit quality")
+        .open(&mut open)
+        .resizable(true)
+        .collapsible(false)
+        .default_width(480.0)
+        .default_height(280.0)
+        .show(ctx, |ui| {
+            ui.label("Quality string (Phred+33 ASCII; whitespace ignored):");
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(app.edit_qual_input_mut())
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(10)
+                            .code_editor(),
+                    );
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    app.close_edit_qual_dialog(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    app.close_edit_qual_dialog(false);
+                }
+            });
+        });
+    if !open {
+        app.close_edit_qual_dialog(false);
+    }
+}
+
+/// Bottom status bar: path, size, format, record count, offset, dirty flag.
 fn status_bar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 18.0;
         let count = app.document_count();
+        let dirty = app.active_is_dirty();
+        let edit_count = app.active_edit_count();
         match app.active_document() {
             Some(doc) => {
                 let meta = doc.metadata();
@@ -576,12 +1122,42 @@ fn status_bar(app: &mut SeqFlashApp, ui: &mut egui::Ui) {
                             idx.entry_count()
                         ));
                     }
+                } else if let Some(idx) = app.active_fastq_index() {
+                    let rec = idx.entry_count();
+                    if idx.is_complete() {
+                        ui.label(format!(
+                            "Record {}/{}",
+                            app.current_record_number().map_or(0, |n| n + 1),
+                            rec
+                        ));
+                    } else {
+                        let pct =
+                            u8::try_from(idx.scan_progress() * 100 / meta.size.max(1)).unwrap_or(0);
+                        ui.label(format!("Indexing {pct}% ({rec} records)"));
+                    }
                 }
                 ui.label(format!(
                     "offset {} / {}",
                     app.active_top_offset(),
                     meta.size
                 ));
+                if dirty {
+                    ui.label(
+                        egui::RichText::new(format!("● modified ({edit_count})"))
+                            .color(egui::Color32::from_rgb(220, 160, 40)),
+                    );
+                }
+                if let Some((done, total)) = app.save_progress() {
+                    let pct = done
+                        .checked_mul(100)
+                        .and_then(|n| n.checked_div(total))
+                        .and_then(|n| u8::try_from(n).ok())
+                        .unwrap_or(0);
+                    ui.label(
+                        egui::RichText::new(format!("Saving {pct}% ({done}/{total})"))
+                            .color(egui::Color32::from_rgb(80, 160, 220)),
+                    );
+                }
             }
             None => {
                 ui.label(format!("{count} document(s) open"));

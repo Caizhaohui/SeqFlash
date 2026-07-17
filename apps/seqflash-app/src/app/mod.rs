@@ -9,6 +9,7 @@ mod ui;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -18,19 +19,91 @@ use seqflash_formats::detect_format;
 use seqflash_index::{FastaIndex, FastqIndex};
 use seqflash_ops::{
     count_bases, export_fasta_records, export_fastq_records, gc_percent, phred33_quality_stats,
-    BaseCounts, FastaExportRecord, FastqExportRecord, QualityStats, Transform,
+    save_fasta_with_overlay_ex, save_fastq_with_overlay_ex, BaseCounts, EditOverlay,
+    FastaExportRecord, FastaOverlayEntry, FastqExportRecord, FastqOverlayEntry, QualityStats,
+    RecordEdit, Transform, RECORD_EDIT_LIMIT_BYTES,
 };
 use seqflash_search::{SearchMode, SearchSession};
 use seqflash_settings::AppSettings;
-use seqflash_types::{ByteRange, DocumentId};
+use seqflash_types::{ByteRange, DocumentId, SequenceFormat};
 use seqflash_viewer::RawTextViewer;
+
+/// In-flight background overlay save (plan 20.3: progress + cancel).
+struct OverlaySaveJob {
+    document_id: DocumentId,
+    dest: PathBuf,
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    /// Filled by the worker when finished; `None` while running.
+    result: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+/// Owned index snapshot for a background overlay save.
+enum OverlaySaveEntries {
+    Fasta(Vec<FastaOverlayEntry>),
+    Fastq(Vec<FastqOverlayEntry>),
+}
 
 /// Maximum number of entries kept in the in-memory recent-files list.
 const RECENT_FILES_LIMIT: usize = 10;
 
+/// Max sequence/quality characters shown in overlay text previews.
+const PREVIEW_FIELD_CHARS: usize = 480;
+
+/// Per-record overlay flags for list badges and preview chrome.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RecordEditFlags {
+    pub deleted: bool,
+    pub replaced: bool,
+    pub inserts_before: usize,
+    pub inserts_after: usize,
+}
+
+impl RecordEditFlags {
+    #[must_use]
+    pub(crate) const fn has_any(self) -> bool {
+        self.deleted || self.replaced || self.inserts_before > 0 || self.inserts_after > 0
+    }
+
+    /// Short badge text for the record list, e.g. `[DEL]`, `[EDIT +B1]`.
+    #[must_use]
+    pub(crate) fn badge(self) -> Option<String> {
+        if !self.has_any() {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.deleted {
+            parts.push("DEL".into());
+        } else if self.replaced {
+            parts.push("EDIT".into());
+        }
+        if self.inserts_before > 0 {
+            parts.push(format!("+B{}", self.inserts_before));
+        }
+        if self.inserts_after > 0 {
+            parts.push(format!("+A{}", self.inserts_after));
+        }
+        Some(format!("[{}]", parts.join(" ")))
+    }
+}
+
+/// Overlay-resolved view of one record for UI preview (plan M7: delete/replace preview).
+#[derive(Clone, Debug)]
+pub(crate) struct OverlayRecordPreview {
+    pub flags: RecordEditFlags,
+    pub header: Option<String>,
+    pub sequence: Option<String>,
+    pub quality: Option<String>,
+    /// Full effective record body (or a deleted placeholder). Truncated for display.
+    pub body_preview: String,
+    pub inserts_before: Vec<String>,
+    pub inserts_after: Vec<String>,
+}
+
 /// Top-level SeqFlash egui application.
+#[allow(clippy::struct_excessive_bools)] // dialog visibility flags; kept explicit for UI wiring
 pub(crate) struct SeqFlashApp {
-    #[allow(dead_code)]
     settings: AppSettings,
     documents: DocumentList,
     active_document: Option<DocumentId>,
@@ -67,6 +140,26 @@ pub(crate) struct SeqFlashApp {
     search_mode: SearchMode,
     /// Currently selected search result index (for prev/next navigation).
     current_search_result: Option<usize>,
+    /// One edit overlay per open document.
+    overlays: HashMap<DocumentId, EditOverlay>,
+    /// Text input for editing a record header.
+    edit_header_input: String,
+    /// Text input for editing a record sequence.
+    edit_seq_input: String,
+    /// Text input for editing a FASTQ quality string.
+    edit_qual_input: String,
+    /// Whether the edit-header dialog is open.
+    show_edit_header: bool,
+    /// Whether the edit-sequence dialog is open.
+    show_edit_seq: bool,
+    /// Whether the edit-quality dialog is open.
+    show_edit_qual: bool,
+    /// Whether the insert-record dialog is open.
+    show_insert: bool,
+    /// Insert placement: `true` = before current record, `false` = after.
+    insert_before: bool,
+    /// Background overlay save, if any.
+    save_job: Option<OverlaySaveJob>,
 }
 
 impl SeqFlashApp {
@@ -92,6 +185,16 @@ impl SeqFlashApp {
             search_input: String::new(),
             search_mode: SearchMode::RawBytes,
             current_search_result: None,
+            overlays: HashMap::new(),
+            edit_header_input: String::new(),
+            edit_seq_input: String::new(),
+            edit_qual_input: String::new(),
+            show_edit_header: false,
+            show_edit_seq: false,
+            show_edit_qual: false,
+            show_insert: false,
+            insert_before: true,
+            save_job: None,
         };
         if let Some(path) = initial_file {
             app.open_path(&path);
@@ -132,6 +235,11 @@ impl SeqFlashApp {
     /// Borrow the current transient notice text, if any.
     pub(crate) fn notice_text(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    /// Set a user-facing notice (errors, save results, …).
+    pub(crate) fn set_notice(&mut self, msg: impl Into<String>) {
+        self.notice = Some(msg.into());
     }
 
     /// The active document id, if any.
@@ -176,7 +284,7 @@ impl SeqFlashApp {
                 tracing::info!(path = %path.display(), "opened document");
             }
             Err(err) => {
-                let msg = format!("Could not open {}: {err}", path.display());
+                let msg = user_facing_open_error(path, &err);
                 tracing::warn!(path = %path.display(), %err, "open failed");
                 self.notice = Some(msg);
             }
@@ -224,6 +332,7 @@ impl SeqFlashApp {
         self.fasta_indexes.remove(&id);
         self.fastq_indexes.remove(&id);
         self.search_sessions.remove(&id);
+        self.overlays.remove(&id);
         if was_active {
             self.active_document = self.documents.iter().next().map(Document::id);
             self.active_top_offset = 0;
@@ -290,28 +399,19 @@ impl SeqFlashApp {
             .and_then(|id| self.fastq_indexes.get(&id))
     }
 
-    /// Quality stats for a FASTQ record.
+    /// Quality stats for a FASTQ record (overlay-aware).
     #[must_use]
     pub(crate) fn fastq_quality_for(&self, id: DocumentId, rec_num: u64) -> Option<QualityStats> {
         let doc = self.documents.get(id)?;
-        let idx = self.fastq_indexes.get(&id)?;
-        let entry = idx
-            .entries()
-            .get(usize::try_from(rec_num).unwrap_or(usize::MAX))?;
-        let bytes = doc.bytes();
-        let qs = usize::try_from(entry.quality_range.start).unwrap_or(0);
-        let qe = usize::try_from(entry.quality_range.end)
-            .unwrap_or(bytes.len())
-            .min(bytes.len());
-        if qs >= qe {
+        if doc.format() != SequenceFormat::Fastq {
             return None;
         }
-        let qual: Vec<u8> = bytes[qs..qe]
-            .iter()
-            .copied()
-            .filter(|&b| b != b'\n' && b != b'\r')
-            .collect();
-        Some(phred33_quality_stats(&qual, 20))
+        if self.record_edit_flags(id, rec_num).deleted {
+            return None;
+        }
+        let (_h, _seq, qual) = self.fields_for(id, rec_num)?;
+        let qual = qual?;
+        Some(phred33_quality_stats(qual.as_bytes(), 20))
     }
 
     /// The currently selected record number (0-based), within the active
@@ -328,8 +428,19 @@ impl SeqFlashApp {
             return;
         };
         if let Some(idx) = self.fasta_indexes.get(&id) {
-            if record_number < idx.entries().len() as u64 {
-                let entry = &idx.entries()[usize::try_from(record_number).unwrap_or(usize::MAX)];
+            if let Some(entry) = idx
+                .entries()
+                .get(usize::try_from(record_number).unwrap_or(usize::MAX))
+            {
+                self.scroll_active_to_byte(entry.start_offset);
+                return;
+            }
+        }
+        if let Some(idx) = self.fastq_indexes.get(&id) {
+            if let Some(entry) = idx
+                .entries()
+                .get(usize::try_from(record_number).unwrap_or(usize::MAX))
+            {
                 self.scroll_active_to_byte(entry.start_offset);
             }
         }
@@ -347,37 +458,121 @@ impl SeqFlashApp {
         self.go_to_record(n.saturating_sub(1));
     }
 
-    /// Compute statistics for the given record's sequence bytes.
-    /// Returns None if the record doesn't exist or is not FASTA.
+    /// Compute statistics for the given record's sequence (overlay-aware).
+    /// Returns None if the record is deleted, missing, or not FASTA.
     #[must_use]
     pub(crate) fn record_stats(&self, id: DocumentId, rec: u64) -> Option<(BaseCounts, f64)> {
         let doc = self.documents.get(id)?;
-        let idx = self.fasta_indexes.get(&id)?;
-        let entries = idx.entries();
-        let entry = entries.get(usize::try_from(rec).unwrap_or(usize::MAX))?;
-        let bytes = doc.bytes();
-        // Extract sequence bytes: skip past header line, strip newlines.
-        let hdr_end = entry.header_range.end;
-        let seq_start = usize::try_from(hdr_end + 1).unwrap_or(0); // skip past \n
-        let seq_end = usize::try_from(entry.end_offset)
-            .unwrap_or(bytes.len())
-            .min(bytes.len());
-        // Only consider FASTA format for stats.
-        if doc.format() != seqflash_types::SequenceFormat::Fasta {
+        if doc.format() != SequenceFormat::Fasta {
             return None;
         }
-        if seq_start >= seq_end {
-            let counts = BaseCounts::default();
-            return Some((counts, 0.0));
+        if self.record_edit_flags(id, rec).deleted {
+            return None;
         }
-        let raw: Vec<u8> = bytes[seq_start..seq_end]
-            .iter()
-            .copied()
-            .filter(|&b| b != b'\n' && b != b'\r')
-            .collect();
-        let counts = count_bases(&raw);
+        let (_h, seq, _q) = self.fields_for(id, rec)?;
+        let counts = count_bases(seq.as_bytes());
         let gc = gc_percent(&counts);
         Some((counts, gc))
+    }
+
+    /// Overlay edit flags for a specific record on `id`.
+    #[must_use]
+    pub(crate) fn record_edit_flags(&self, id: DocumentId, rec: u64) -> RecordEditFlags {
+        let Some(ov) = self.overlays.get(&id) else {
+            return RecordEditFlags::default();
+        };
+        let Some(edits) = ov.edits_for(rec) else {
+            return RecordEditFlags::default();
+        };
+        let mut flags = RecordEditFlags::default();
+        for edit in edits {
+            match edit {
+                RecordEdit::Delete { .. } => flags.deleted = true,
+                RecordEdit::Replace { .. } => flags.replaced = true,
+                RecordEdit::InsertBefore { .. } => flags.inserts_before += 1,
+                RecordEdit::InsertAfter { .. } => flags.inserts_after += 1,
+            }
+        }
+        flags
+    }
+
+    /// Overlay flags for the currently selected record.
+    #[must_use]
+    pub(crate) fn current_record_edit_flags(&self) -> RecordEditFlags {
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return RecordEditFlags::default();
+        };
+        self.record_edit_flags(id, rec)
+    }
+
+    /// Build an overlay-resolved preview for the current record (for UI).
+    #[must_use]
+    pub(crate) fn current_overlay_preview(&self) -> Option<OverlayRecordPreview> {
+        let id = self.active_document?;
+        let rec = self.current_record_number?;
+        self.overlay_preview_for(id, rec)
+    }
+
+    /// Overlay-resolved preview for any indexed record.
+    #[must_use]
+    pub(crate) fn overlay_preview_for(
+        &self,
+        id: DocumentId,
+        rec: u64,
+    ) -> Option<OverlayRecordPreview> {
+        let doc = self.documents.get(id)?;
+        let format = doc.format();
+        let flags = self.record_edit_flags(id, rec);
+
+        let (inserts_before, inserts_after) = self.collect_insert_previews(id, rec);
+
+        if flags.deleted {
+            return Some(OverlayRecordPreview {
+                flags,
+                header: None,
+                sequence: None,
+                quality: None,
+                body_preview: format!(
+                    "(record {} deleted in overlay — omitted on Save edits)",
+                    rec + 1
+                ),
+                inserts_before,
+                inserts_after,
+            });
+        }
+
+        // Ensure the record exists in an index (or has a replace payload).
+        let fields = self.fields_for(id, rec);
+        let Some((header, sequence, quality)) = fields else {
+            if flags.has_any() {
+                // Inserts only on a still-loading record edge case.
+                return Some(OverlayRecordPreview {
+                    flags,
+                    header: None,
+                    sequence: None,
+                    quality: None,
+                    body_preview: "(record not available yet)".into(),
+                    inserts_before,
+                    inserts_after,
+                });
+            }
+            return None;
+        };
+
+        let body = match build_record_bytes(format, &header, &sequence, quality.as_deref()) {
+            Ok(bytes) => truncate_preview(&String::from_utf8_lossy(&bytes)),
+            Err(_) => truncate_preview(&format!(">{header}\n{sequence}\n")),
+        };
+
+        Some(OverlayRecordPreview {
+            flags,
+            header: Some(header),
+            sequence: Some(truncate_preview(&sequence)),
+            quality: quality.map(|q| truncate_preview(&q)),
+            body_preview: body,
+            inserts_before,
+            inserts_after,
+        })
     }
 
     /// The active FastaIndex for UI read (immutable borrow).
@@ -740,66 +935,1014 @@ impl SeqFlashApp {
     }
 
     pub(crate) fn copy_current_header(&mut self) {
-        if let Some(t) = self.get_field(true, false, false) {
+        if let Some(t) = self.current_header_text() {
             self.pending_clipboard = Some(t);
         }
     }
     pub(crate) fn copy_current_sequence(&mut self) {
-        if let Some(t) = self.get_field(false, true, false) {
+        if let Some(t) = self.current_sequence_text() {
             self.pending_clipboard = Some(t);
         }
     }
     pub(crate) fn copy_current_quality(&mut self) {
-        if let Some(t) = self.get_field(false, false, true) {
+        if let Some(t) = self.current_quality_text() {
             self.pending_clipboard = Some(t);
         }
     }
 
-    fn get_field(&self, hdr: bool, seq: bool, qual: bool) -> Option<String> {
-        use seqflash_types::SequenceFormat;
-        let id = self.active_document?;
-        let doc = self.documents.get(id)?;
-        let bytes = doc.bytes();
-        let rec = self.current_record_number?;
-        match doc.format() {
+    // ---- M7: Edit overlay ----
+
+    /// Active document has unsaved overlay edits.
+    #[must_use]
+    pub(crate) fn active_is_dirty(&self) -> bool {
+        self.active_document
+            .is_some_and(|id| self.document_is_dirty(id))
+    }
+
+    /// Whether `id` has unsaved overlay edits.
+    #[must_use]
+    pub(crate) fn document_is_dirty(&self, id: DocumentId) -> bool {
+        self.overlays.get(&id).is_some_and(EditOverlay::is_dirty)
+    }
+
+    /// Number of records with pending edits on the active document.
+    #[must_use]
+    pub(crate) fn active_edit_count(&self) -> usize {
+        self.active_document
+            .and_then(|id| self.overlays.get(&id))
+            .map_or(0, EditOverlay::edited_record_count)
+    }
+
+    /// Whether the currently selected record is marked deleted in the overlay.
+    #[must_use]
+    pub(crate) fn current_record_is_deleted(&self) -> bool {
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return false;
+        };
+        self.overlays
+            .get(&id)
+            .and_then(|ov| ov.edits_for(rec))
+            .is_some_and(|edits| edits.iter().any(RecordEdit::is_delete))
+    }
+
+    #[must_use]
+    pub(crate) fn can_undo(&self) -> bool {
+        self.active_document
+            .and_then(|id| self.overlays.get(&id))
+            .is_some_and(EditOverlay::can_undo)
+    }
+
+    #[must_use]
+    pub(crate) fn can_redo(&self) -> bool {
+        self.active_document
+            .and_then(|id| self.overlays.get(&id))
+            .is_some_and(EditOverlay::can_redo)
+    }
+
+    pub(crate) fn undo_edit(&mut self) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        if self.overlays.entry(id).or_default().undo() {
+            self.notice = Some("Undid last edit.".into());
+        }
+    }
+
+    pub(crate) fn redo_edit(&mut self) {
+        let Some(id) = self.active_document else {
+            return;
+        };
+        if self.overlays.entry(id).or_default().redo() {
+            self.notice = Some("Redid edit.".into());
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn show_edit_header(&self) -> bool {
+        self.show_edit_header
+    }
+    #[must_use]
+    pub(crate) const fn show_edit_seq(&self) -> bool {
+        self.show_edit_seq
+    }
+    #[must_use]
+    pub(crate) const fn show_edit_qual(&self) -> bool {
+        self.show_edit_qual
+    }
+
+    pub(crate) fn edit_header_input_mut(&mut self) -> &mut String {
+        &mut self.edit_header_input
+    }
+    pub(crate) fn edit_seq_input_mut(&mut self) -> &mut String {
+        &mut self.edit_seq_input
+    }
+    pub(crate) fn edit_qual_input_mut(&mut self) -> &mut String {
+        &mut self.edit_qual_input
+    }
+
+    /// Open the edit-header dialog, pre-filled from the current (overlay-aware) header.
+    pub(crate) fn open_edit_header_dialog(&mut self) {
+        if !self.ensure_record_editable() {
+            return;
+        }
+        self.edit_header_input = self.current_header_text().unwrap_or_default();
+        self.show_edit_header = true;
+        self.show_edit_seq = false;
+        self.show_edit_qual = false;
+        self.show_insert = false;
+    }
+
+    /// Open the edit-sequence dialog.
+    pub(crate) fn open_edit_seq_dialog(&mut self) {
+        if !self.ensure_record_editable() {
+            return;
+        }
+        self.edit_seq_input = self.current_sequence_text().unwrap_or_default();
+        self.show_edit_seq = true;
+        self.show_edit_header = false;
+        self.show_edit_qual = false;
+        self.show_insert = false;
+    }
+
+    /// Open the edit-quality dialog (FASTQ only).
+    pub(crate) fn open_edit_qual_dialog(&mut self) {
+        if !self.ensure_record_editable() {
+            return;
+        }
+        let is_fastq = self
+            .active_document()
+            .is_some_and(|d| d.format() == SequenceFormat::Fastq);
+        if !is_fastq {
+            self.notice = Some("Quality editing is only available for FASTQ.".into());
+            return;
+        }
+        self.edit_qual_input = self.current_quality_text().unwrap_or_default();
+        self.show_edit_qual = true;
+        self.show_edit_header = false;
+        self.show_edit_seq = false;
+        self.show_insert = false;
+    }
+
+    /// Open the insert-record dialog (before or after the current record).
+    pub(crate) fn open_insert_dialog(&mut self, before: bool) {
+        if self.current_record_number.is_none() {
+            self.notice = Some("Select a record first.".into());
+            return;
+        }
+        // Verify the anchor record exists in the index.
+        if self.current_record_byte_size().is_none() {
+            self.notice = Some("Record not found in the index yet.".into());
+            return;
+        }
+        self.insert_before = before;
+        self.edit_header_input = "new_record".into();
+        self.edit_seq_input = "N".into();
+        // Phred+33 Q40 placeholder so FASTQ length matches a single 'N'.
+        self.edit_qual_input = "I".into();
+        self.show_insert = true;
+        self.show_edit_header = false;
+        self.show_edit_seq = false;
+        self.show_edit_qual = false;
+    }
+
+    #[must_use]
+    pub(crate) const fn show_insert(&self) -> bool {
+        self.show_insert
+    }
+
+    #[must_use]
+    pub(crate) const fn insert_before(&self) -> bool {
+        self.insert_before
+    }
+
+    pub(crate) fn set_insert_before(&mut self, before: bool) {
+        self.insert_before = before;
+    }
+
+    pub(crate) fn close_insert_dialog(&mut self, apply: bool) {
+        if apply {
+            if let Err(msg) = self.apply_insert() {
+                self.notice = Some(msg);
+                return;
+            }
+            let where_ = if self.insert_before {
+                "before"
+            } else {
+                "after"
+            };
+            self.notice = Some(format!(
+                "Inserted record {where_} current (overlay). Save to write a new file."
+            ));
+        }
+        self.show_insert = false;
+    }
+
+    pub(crate) fn close_edit_header_dialog(&mut self, apply: bool) {
+        if apply {
+            if let Err(msg) = self.apply_header_edit() {
+                self.notice = Some(msg);
+                return;
+            }
+            self.notice = Some("Header updated (overlay). Save to write a new file.".into());
+        }
+        self.show_edit_header = false;
+    }
+
+    pub(crate) fn close_edit_seq_dialog(&mut self, apply: bool) {
+        if apply {
+            if let Err(msg) = self.apply_sequence_edit() {
+                self.notice = Some(msg);
+                return;
+            }
+            self.notice = Some("Sequence updated (overlay). Save to write a new file.".into());
+        }
+        self.show_edit_seq = false;
+    }
+
+    pub(crate) fn close_edit_qual_dialog(&mut self, apply: bool) {
+        if apply {
+            if let Err(msg) = self.apply_quality_edit() {
+                self.notice = Some(msg);
+                return;
+            }
+            self.notice = Some("Quality updated (overlay). Save to write a new file.".into());
+        }
+        self.show_edit_qual = false;
+    }
+
+    /// Mark the current record as deleted in the overlay (source file untouched).
+    pub(crate) fn delete_current_record(&mut self) {
+        if !self.ensure_record_editable() {
+            return;
+        }
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return;
+        };
+        self.overlays
+            .entry(id)
+            .or_default()
+            .apply(RecordEdit::Delete { record_number: rec });
+        self.notice = Some(format!(
+            "Record {} marked deleted (overlay). Save to write a new file.",
+            rec + 1
+        ));
+    }
+
+    /// Whether an overlay save is currently running in the background.
+    #[must_use]
+    pub(crate) fn save_in_progress(&self) -> bool {
+        self.save_job.is_some()
+    }
+
+    /// `(done, total)` progress of the in-flight save, if any.
+    #[must_use]
+    pub(crate) fn save_progress(&self) -> Option<(u64, u64)> {
+        self.save_job.as_ref().map(|j| {
+            (
+                j.done.load(Ordering::Relaxed),
+                j.total.load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// Request cancellation of the in-flight overlay save.
+    pub(crate) fn cancel_save(&mut self) {
+        if let Some(job) = &self.save_job {
+            job.cancel.store(true, Ordering::Relaxed);
+            self.notice = Some("Cancelling save…".into());
+        }
+    }
+
+    /// Start streaming the active document through the overlay into `path`
+    /// on a background thread (plan 20.3). Never overwrites the open source.
+    ///
+    /// # Errors
+    ///
+    /// Returns immediately if preconditions fail (no doc, overwrite source,
+    /// indexing incomplete, save already running). The write itself reports
+    /// via [`poll_save_job`].
+    pub(crate) fn start_save_with_overlay(
+        &mut self,
+        path: &Path,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if self.save_job.is_some() {
+            return Err("A save is already in progress.".into());
+        }
+
+        let id = self.active_document.ok_or("No document open.")?;
+        let prep = self.prepare_overlay_save(id, path)?;
+        let total_records = match &prep.entries {
+            OverlaySaveEntries::Fasta(e) => e.len() as u64,
+            OverlaySaveEntries::Fastq(e) => e.len() as u64,
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(total_records));
+        let result: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
+
+        spawn_overlay_save_worker(
+            prep,
+            Arc::clone(&cancel),
+            Arc::clone(&done),
+            Arc::clone(&total),
+            Arc::clone(&result),
+            ctx.clone(),
+        );
+
+        self.save_job = Some(OverlaySaveJob {
+            document_id: id,
+            dest: path.to_path_buf(),
+            cancel,
+            done,
+            total,
+            result,
+        });
+        self.notice = Some(format!("Saving {total_records} record(s)…"));
+        Ok(())
+    }
+
+    /// Validate preconditions and snapshot everything the worker needs.
+    fn prepare_overlay_save(
+        &mut self,
+        id: DocumentId,
+        path: &Path,
+    ) -> Result<OverlaySavePrep, String> {
+        let (source_path, format, opened_size, opened_modified) = {
+            let doc = self.documents.get(id).ok_or("Document missing.")?;
+            let meta = doc.metadata();
+            (meta.path.clone(), doc.format(), meta.size, meta.modified)
+        };
+        if same_path(&source_path, path) {
+            return Err(
+                "Cannot overwrite the open source file. Choose a different path (Save As).".into(),
+            );
+        }
+        {
+            let doc = self.documents.get(id).ok_or("Document missing.")?;
+            if doc
+                .has_external_changes()
+                .map_err(|e| format!("Could not check source file: {e}"))?
+            {
+                return Err(
+                    "Source file changed on disk. Re-open the file before saving edits.".into(),
+                );
+            }
+        }
+
+        let overlay = self.overlays.entry(id).or_default().clone();
+        let entries = match format {
             SequenceFormat::Fasta => {
-                let idx = self.fasta_indexes.get(&id)?;
-                let e = idx.entries().get(usize::try_from(rec).ok()?)?;
-                if hdr {
-                    let a = usize::try_from(e.header_range.start).ok()?;
-                    let b = usize::try_from(e.header_range.end).ok()?;
-                    return Some(String::from_utf8_lossy(slice_header(&bytes[a..b])).into_owned());
+                let idx = self.fasta_indexes.get(&id).ok_or("FASTA index missing.")?;
+                if !idx.is_complete() {
+                    return Err("Indexing is still running. Wait until it finishes.".into());
                 }
-                if seq {
-                    let a = usize::try_from(e.header_range.end).ok()?;
-                    let b = usize::try_from(e.end_offset).ok()?.min(bytes.len());
-                    return Some(String::from_utf8_lossy(&bytes[a..b]).into_owned());
-                }
-                None
+                OverlaySaveEntries::Fasta(
+                    idx.entries()
+                        .iter()
+                        .map(|e| FastaOverlayEntry {
+                            record_number: e.record_number,
+                            start_offset: e.start_offset,
+                            end_offset: e.end_offset,
+                        })
+                        .collect(),
+                )
             }
             SequenceFormat::Fastq => {
-                let idx = self.fastq_indexes.get(&id)?;
-                let e = idx.entries().get(usize::try_from(rec).ok()?)?;
-                if hdr {
-                    let a = usize::try_from(e.header_range.start).ok()?;
-                    let b = usize::try_from(e.header_range.end).ok()?;
-                    return Some(String::from_utf8_lossy(slice_header(&bytes[a..b])).into_owned());
+                let idx = self.fastq_indexes.get(&id).ok_or("FASTQ index missing.")?;
+                if !idx.is_complete() {
+                    return Err("Indexing is still running. Wait until it finishes.".into());
                 }
-                if seq {
-                    let a = usize::try_from(e.sequence_range.start).ok()?;
-                    let b = usize::try_from(e.sequence_range.end).ok()?.min(bytes.len());
-                    return Some(String::from_utf8_lossy(&bytes[a..b]).into_owned());
+                OverlaySaveEntries::Fastq(
+                    idx.entries()
+                        .iter()
+                        .map(|e| FastqOverlayEntry {
+                            record_number: e.record_number,
+                            start_offset: e.start_offset,
+                            end_offset: e.end_offset,
+                        })
+                        .collect(),
+                )
+            }
+            SequenceFormat::Unknown => {
+                return Err("Unsupported format for overlay save.".into());
+            }
+        };
+
+        Ok(OverlaySavePrep {
+            source_path,
+            dest: path.to_path_buf(),
+            opened_size,
+            opened_modified,
+            overlay,
+            entries,
+        })
+    }
+
+    /// Poll the background save job; apply success/failure notices and clear overlay.
+    fn poll_save_job(&mut self) {
+        let finished = {
+            let Some(job) = &self.save_job else {
+                return;
+            };
+            job.result.lock().ok().and_then(|mut g| g.take())
+        };
+        let Some(outcome) = finished else {
+            return;
+        };
+        let Some(job) = self.save_job.take() else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
+                if let Some(ov) = self.overlays.get_mut(&job.document_id) {
+                    ov.clear();
                 }
-                if qual {
-                    let a = usize::try_from(e.quality_range.start).ok()?;
-                    let b = usize::try_from(e.quality_range.end).ok()?.min(bytes.len());
-                    return Some(String::from_utf8_lossy(&bytes[a..b]).into_owned());
+                self.notice = Some(format!("Saved with edits to {}.", job.dest.display()));
+                tracing::info!(path = %job.dest.display(), "overlay save complete");
+            }
+            Err(msg) => {
+                // Keep overlay so the user can retry or continue editing.
+                if msg.to_ascii_lowercase().contains("cancel") {
+                    self.notice = Some("Save cancelled. Overlay edits were kept.".into());
+                } else {
+                    self.notice = Some(format!("Save failed: {msg}"));
                 }
-                None
+                tracing::warn!(path = %job.dest.display(), error = %msg, "overlay save failed");
+            }
+        }
+    }
+
+    /// Header text for the current record (overlay-aware).
+    #[must_use]
+    pub(crate) fn current_header_text(&self) -> Option<String> {
+        let id = self.active_document?;
+        let rec = self.current_record_number?;
+        self.fields_for(id, rec).map(|(h, _, _)| h)
+    }
+
+    /// Sequence text for the current record (overlay-aware, whitespace-stripped display).
+    #[must_use]
+    pub(crate) fn current_sequence_text(&self) -> Option<String> {
+        let id = self.active_document?;
+        let rec = self.current_record_number?;
+        self.fields_for(id, rec).map(|(_, s, _)| s)
+    }
+
+    /// Quality text for the current FASTQ record (overlay-aware).
+    #[must_use]
+    pub(crate) fn current_quality_text(&self) -> Option<String> {
+        let id = self.active_document?;
+        let rec = self.current_record_number?;
+        self.fields_for(id, rec).and_then(|(_, _, q)| q)
+    }
+
+    /// Reject oversized / missing / already-deleted records before edit UI opens.
+    fn ensure_record_editable(&mut self) -> bool {
+        let Some(rec) = self.current_record_number else {
+            self.notice = Some("Select a record first.".into());
+            return false;
+        };
+        if self.current_record_is_deleted() {
+            self.notice = Some(format!(
+                "Record {} is marked deleted. Undo to restore it.",
+                rec + 1
+            ));
+            return false;
+        }
+        let Some(size) = self.current_record_byte_size() else {
+            self.notice = Some("Record not found in the index yet.".into());
+            return false;
+        };
+        // Configurable threshold (plan 18.3); fall back to the ops default.
+        let limit = if self.settings.record_edit_limit_bytes == 0 {
+            RECORD_EDIT_LIMIT_BYTES
+        } else {
+            self.settings.record_edit_limit_bytes
+        };
+        if size > limit {
+            self.notice = Some(format!(
+                "Record is too large to edit in-memory ({size} bytes > {limit} limit)."
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn current_record_byte_size(&self) -> Option<u64> {
+        let id = self.active_document?;
+        let rec = self.current_record_number?;
+        // Prefer last Replace payload size when present.
+        if let Some(ov) = self.overlays.get(&id) {
+            if let Some(edits) = ov.edits_for(rec) {
+                if let Some(data) = edits.iter().rev().find_map(|e| e.data()) {
+                    return Some(data.len() as u64);
+                }
+            }
+        }
+        let doc = self.documents.get(id)?;
+        match doc.format() {
+            seqflash_types::SequenceFormat::Fasta => {
+                let e = self
+                    .fasta_indexes
+                    .get(&id)?
+                    .entries()
+                    .get(usize::try_from(rec).ok()?)?;
+                Some(e.end_offset.saturating_sub(e.start_offset))
+            }
+            seqflash_types::SequenceFormat::Fastq => {
+                let e = self
+                    .fastq_indexes
+                    .get(&id)?
+                    .entries()
+                    .get(usize::try_from(rec).ok()?)?;
+                Some(e.end_offset.saturating_sub(e.start_offset))
+            }
+            seqflash_types::SequenceFormat::Unknown => None,
+        }
+    }
+
+    /// Insert payloads (preview strings) for a record's overlay edits.
+    fn collect_insert_previews(&self, id: DocumentId, rec: u64) -> (Vec<String>, Vec<String>) {
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        let Some(ov) = self.overlays.get(&id) else {
+            return (before, after);
+        };
+        let Some(edits) = ov.edits_for(rec) else {
+            return (before, after);
+        };
+        for edit in edits {
+            match edit {
+                RecordEdit::InsertBefore { data, .. } => {
+                    before.push(truncate_preview(&String::from_utf8_lossy(data)));
+                }
+                RecordEdit::InsertAfter { data, .. } => {
+                    after.push(truncate_preview(&String::from_utf8_lossy(data)));
+                }
+                RecordEdit::Delete { .. } | RecordEdit::Replace { .. } => {}
+            }
+        }
+        (before, after)
+    }
+
+    /// Overlay-aware (header, sequence, optional quality) for any record.
+    fn fields_for(&self, id: DocumentId, rec: u64) -> Option<(String, String, Option<String>)> {
+        let doc = self.documents.get(id)?;
+
+        // If a Replace is present, parse fields from the replacement payload.
+        if let Some(ov) = self.overlays.get(&id) {
+            if let Some(edits) = ov.edits_for(rec) {
+                if edits.iter().any(RecordEdit::is_delete) {
+                    return None;
+                }
+                if let Some(data) = edits.iter().rev().find_map(|e| match e {
+                    RecordEdit::Replace { data, .. } => Some(data.as_slice()),
+                    _ => None,
+                }) {
+                    return parse_record_fields(doc.format(), data);
+                }
+            }
+        }
+
+        // Fall back to original index ranges.
+        let bytes = doc.bytes();
+        match doc.format() {
+            SequenceFormat::Fasta => {
+                let e = self
+                    .fasta_indexes
+                    .get(&id)?
+                    .entries()
+                    .get(usize::try_from(rec).ok()?)?;
+                let hs = usize::try_from(e.header_range.start).ok()?;
+                let he = usize::try_from(e.header_range.end).ok()?;
+                let se = usize::try_from(e.end_offset).ok()?.min(bytes.len());
+                let header = String::from_utf8_lossy(slice_header(&bytes[hs..he.min(bytes.len())]))
+                    .into_owned();
+                let seq = strip_ws(&bytes[he.min(bytes.len())..se]);
+                Some((header, seq, None))
+            }
+            SequenceFormat::Fastq => {
+                let e = self
+                    .fastq_indexes
+                    .get(&id)?
+                    .entries()
+                    .get(usize::try_from(rec).ok()?)?;
+                let hs = usize::try_from(e.header_range.start).ok()?;
+                let he = usize::try_from(e.header_range.end).ok()?;
+                let ss = usize::try_from(e.sequence_range.start).ok()?;
+                let se = usize::try_from(e.sequence_range.end).ok()?.min(bytes.len());
+                let qs = usize::try_from(e.quality_range.start).ok()?;
+                let qe = usize::try_from(e.quality_range.end).ok()?.min(bytes.len());
+                let header = String::from_utf8_lossy(slice_header(&bytes[hs..he.min(bytes.len())]))
+                    .into_owned();
+                let seq = strip_ws(&bytes[ss..se]);
+                let qual = strip_ws(&bytes[qs..qe]);
+                Some((header, seq, Some(qual)))
             }
             SequenceFormat::Unknown => None,
         }
     }
+
+    fn apply_header_edit(&mut self) -> Result<(), String> {
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return Err("No record selected.".into());
+        };
+        let format = self
+            .documents
+            .get(id)
+            .map(Document::format)
+            .ok_or("Document missing.")?;
+        let (_old_header, seq, qual) = self
+            .fields_for(id, rec)
+            .ok_or("Cannot load current record fields.")?;
+        let new_header = self.edit_header_input.trim();
+        if new_header.is_empty() {
+            return Err("Header must not be empty.".into());
+        }
+        let data = build_record_bytes(format, new_header, &seq, qual.as_deref())?;
+        self.overlays
+            .entry(id)
+            .or_default()
+            .apply(RecordEdit::Replace {
+                record_number: rec,
+                data,
+            });
+        Ok(())
+    }
+
+    fn apply_sequence_edit(&mut self) -> Result<(), String> {
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return Err("No record selected.".into());
+        };
+        let format = self
+            .documents
+            .get(id)
+            .map(Document::format)
+            .ok_or("Document missing.")?;
+        let (header, _old_seq, qual) = self
+            .fields_for(id, rec)
+            .ok_or("Cannot load current record fields.")?;
+        let new_seq = strip_ws(self.edit_seq_input.as_bytes());
+        if new_seq.is_empty() {
+            return Err("Sequence must not be empty.".into());
+        }
+        // For FASTQ, keep quality length in sync when possible: if lengths
+        // diverge, require the user to edit quality as well.
+        let qual = match (format, qual) {
+            (SequenceFormat::Fastq, Some(q)) if q.len() != new_seq.len() => {
+                return Err(format!(
+                    "Sequence length ({}) does not match quality length ({}). Edit quality too, or keep lengths equal.",
+                    new_seq.len(),
+                    q.len()
+                ));
+            }
+            (_, q) => q,
+        };
+        let data = build_record_bytes(format, &header, &new_seq, qual.as_deref())?;
+        self.overlays
+            .entry(id)
+            .or_default()
+            .apply(RecordEdit::Replace {
+                record_number: rec,
+                data,
+            });
+        Ok(())
+    }
+
+    fn apply_quality_edit(&mut self) -> Result<(), String> {
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return Err("No record selected.".into());
+        };
+        let format = self
+            .documents
+            .get(id)
+            .map(Document::format)
+            .ok_or("Document missing.")?;
+        if format != SequenceFormat::Fastq {
+            return Err("Quality editing is only available for FASTQ.".into());
+        }
+        let (header, seq, _old_q) = self
+            .fields_for(id, rec)
+            .ok_or("Cannot load current record fields.")?;
+        let new_qual = strip_ws(self.edit_qual_input.as_bytes());
+        if new_qual.len() != seq.len() {
+            return Err(format!(
+                "Quality length ({}) must equal sequence length ({}).",
+                new_qual.len(),
+                seq.len()
+            ));
+        }
+        let data = build_record_bytes(format, &header, &seq, Some(&new_qual))?;
+        self.overlays
+            .entry(id)
+            .or_default()
+            .apply(RecordEdit::Replace {
+                record_number: rec,
+                data,
+            });
+        Ok(())
+    }
+
+    fn apply_insert(&mut self) -> Result<(), String> {
+        let (Some(id), Some(rec)) = (self.active_document, self.current_record_number) else {
+            return Err("No record selected.".into());
+        };
+        let format = self
+            .documents
+            .get(id)
+            .map(Document::format)
+            .ok_or("Document missing.")?;
+        let header = self.edit_header_input.trim();
+        if header.is_empty() {
+            return Err("Header must not be empty.".into());
+        }
+        let seq = strip_ws(self.edit_seq_input.as_bytes());
+        if seq.is_empty() {
+            return Err("Sequence must not be empty.".into());
+        }
+        let qual = match format {
+            SequenceFormat::Fastq => {
+                let q = strip_ws(self.edit_qual_input.as_bytes());
+                if q.len() != seq.len() {
+                    return Err(format!(
+                        "Quality length ({}) must equal sequence length ({}).",
+                        q.len(),
+                        seq.len()
+                    ));
+                }
+                Some(q)
+            }
+            SequenceFormat::Fasta | SequenceFormat::Unknown => None,
+        };
+        let data = build_record_bytes(format, header, &seq, qual.as_deref())?;
+        let edit = if self.insert_before {
+            RecordEdit::InsertBefore {
+                record_number: rec,
+                data,
+            }
+        } else {
+            RecordEdit::InsertAfter {
+                record_number: rec,
+                data,
+            }
+        };
+        self.overlays.entry(id).or_default().apply(edit);
+        Ok(())
+    }
+}
+
+/// Strip whitespace / newlines from sequence or quality bytes into a String.
+fn strip_ws(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// Truncate long preview strings for UI panels.
+fn truncate_preview(s: &str) -> String {
+    let mut out: String = s.chars().take(PREVIEW_FIELD_CHARS).collect();
+    if s.chars().count() > PREVIEW_FIELD_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// Parse fields out of a full record payload (produced by our builders or original).
+fn parse_record_fields(
+    format: seqflash_types::SequenceFormat,
+    data: &[u8],
+) -> Option<(String, String, Option<String>)> {
+    use seqflash_types::SequenceFormat;
+    match format {
+        SequenceFormat::Fasta => {
+            let text = String::from_utf8_lossy(data);
+            let mut lines = text.lines();
+            let header_line = lines.next()?;
+            let header = header_line
+                .strip_prefix('>')
+                .unwrap_or(header_line)
+                .trim()
+                .to_string();
+            let seq: String = lines
+                .flat_map(str::chars)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            Some((header, seq, None))
+        }
+        SequenceFormat::Fastq => {
+            let text = String::from_utf8_lossy(data);
+            let mut lines = text.lines().filter(|l| !l.is_empty());
+            let header_line = lines.next()?;
+            let header = header_line
+                .strip_prefix('@')
+                .unwrap_or(header_line)
+                .trim()
+                .to_string();
+            // After header: sequence lines until a '+' line, then quality lines.
+            let mut seq = String::new();
+            let mut qual = String::new();
+            let mut in_qual = false;
+            for line in lines {
+                if !in_qual && line.starts_with('+') {
+                    in_qual = true;
+                    continue;
+                }
+                if in_qual {
+                    qual.extend(line.chars().filter(|c| !c.is_whitespace()));
+                } else {
+                    seq.extend(line.chars().filter(|c| !c.is_whitespace()));
+                }
+            }
+            Some((header, seq, Some(qual)))
+        }
+        SequenceFormat::Unknown => None,
+    }
+}
+
+/// Build full record bytes for a Replace edit.
+fn build_record_bytes(
+    format: seqflash_types::SequenceFormat,
+    header: &str,
+    sequence: &str,
+    quality: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    use seqflash_types::SequenceFormat;
+    let header = header.trim();
+    let seq: String = sequence.chars().filter(|c| !c.is_whitespace()).collect();
+    match format {
+        SequenceFormat::Fasta => {
+            let mut out = Vec::with_capacity(header.len() + seq.len() + 16);
+            out.push(b'>');
+            out.extend_from_slice(header.as_bytes());
+            out.push(b'\n');
+            // Wrap at 80 columns for readability; empty seq still gets a newline.
+            if seq.is_empty() {
+                out.push(b'\n');
+            } else {
+                for chunk in seq.as_bytes().chunks(80) {
+                    out.extend_from_slice(chunk);
+                    out.push(b'\n');
+                }
+            }
+            Ok(out)
+        }
+        SequenceFormat::Fastq => {
+            let qual = quality.ok_or("FASTQ quality required.")?;
+            let qual: String = qual.chars().filter(|c| !c.is_whitespace()).collect();
+            if seq.len() != qual.len() {
+                return Err(format!(
+                    "Sequence length ({}) != quality length ({}).",
+                    seq.len(),
+                    qual.len()
+                ));
+            }
+            let mut out = Vec::with_capacity(header.len() + seq.len() + qual.len() + 16);
+            out.push(b'@');
+            out.extend_from_slice(header.as_bytes());
+            out.push(b'\n');
+            out.extend_from_slice(seq.as_bytes());
+            out.push(b'\n');
+            out.push(b'+');
+            out.push(b'\n');
+            out.extend_from_slice(qual.as_bytes());
+            out.push(b'\n');
+            Ok(out)
+        }
+        SequenceFormat::Unknown => Err("Unsupported format.".into()),
+    }
+}
+
+/// Turn a document-open failure into a short, actionable notice (M8 error UX).
+fn user_facing_open_error(path: &Path, err: &seqflash_document::DocumentError) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let detail = err.to_string();
+    let hint = if detail.to_ascii_lowercase().contains("not found")
+        || detail.to_ascii_lowercase().contains("cannot find")
+    {
+        " Check that the path exists and is readable."
+    } else if detail.to_ascii_lowercase().contains("access")
+        || detail.to_ascii_lowercase().contains("permission")
+        || detail.to_ascii_lowercase().contains("denied")
+    {
+        " The file may be locked or you may lack permission."
+    } else if detail.to_ascii_lowercase().contains("memory")
+        || detail.to_ascii_lowercase().contains("map")
+    {
+        " The file could not be memory-mapped (disk or OS limit)."
+    } else {
+        ""
+    };
+    format!("Could not open “{name}”: {detail}.{hint}")
+}
+
+/// Best-effort path equality (case-insensitive on Windows).
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    // Canonicalize when possible so relative vs absolute compare fairly.
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        ca == cb
+    } else {
+        // Fall back to lowercase display compare on Windows.
+        let sa = a.to_string_lossy().to_lowercase();
+        let sb = b.to_string_lossy().to_lowercase();
+        sa == sb
+    }
+}
+
+/// True when the on-disk size or mtime differs from the values recorded at open.
+fn source_changed_since(
+    path: &Path,
+    opened_size: u64,
+    opened_modified: std::time::SystemTime,
+) -> Result<bool, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("Could not stat source file: {e}"))?;
+    let modified = meta
+        .modified()
+        .map_err(|e| format!("Could not read source mtime: {e}"))?;
+    Ok(meta.len() != opened_size || modified != opened_modified)
+}
+
+/// Snapshot handed to the overlay-save worker thread.
+struct OverlaySavePrep {
+    source_path: PathBuf,
+    dest: PathBuf,
+    opened_size: u64,
+    opened_modified: std::time::SystemTime,
+    overlay: EditOverlay,
+    entries: OverlaySaveEntries,
+}
+
+fn spawn_overlay_save_worker(
+    prep: OverlaySavePrep,
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    result: Arc<Mutex<Option<Result<(), String>>>>,
+    ctx: egui::Context,
+) {
+    std::thread::spawn(move || {
+        let outcome = run_overlay_save_worker(prep, &cancel, &done, &total, &ctx);
+        if let Ok(mut guard) = result.lock() {
+            *guard = Some(outcome);
+        }
+        ctx.request_repaint();
+    });
+}
+
+fn run_overlay_save_worker(
+    prep: OverlaySavePrep,
+    cancel: &AtomicBool,
+    done: &AtomicU64,
+    total: &AtomicU64,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let OverlaySavePrep {
+        source_path,
+        dest,
+        opened_size,
+        opened_modified,
+        overlay,
+        entries,
+    } = prep;
+
+    // Compare against the UI-open fingerprint (plan 20.4).
+    if source_changed_since(&source_path, opened_size, opened_modified)? {
+        return Err("Source file changed on disk. Re-open the file before saving edits.".into());
+    }
+    // Re-open the source read-only so we do not share the UI-thread mmap.
+    let src = Document::open(&source_path, DocumentId::new(0))
+        .map_err(|e| format!("Could not re-open source for save: {e}"))?;
+    let bytes = src.bytes();
+    let cancel_fn = || cancel.load(Ordering::Relaxed);
+    let progress_fn = |d: u64, t: u64| {
+        done.store(d, Ordering::Relaxed);
+        total.store(t, Ordering::Relaxed);
+        ctx.request_repaint();
+    };
+    match entries {
+        OverlaySaveEntries::Fasta(e) => {
+            save_fasta_with_overlay_ex(bytes, &e, &overlay, &dest, cancel_fn, progress_fn)
+                .map_err(|e| e.to_string())?;
+        }
+        OverlaySaveEntries::Fastq(e) => {
+            save_fastq_with_overlay_ex(bytes, &e, &overlay, &dest, cancel_fn, progress_fn)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    // Final check before the user trusts the published file.
+    if source_changed_since(&source_path, opened_size, opened_modified)? {
+        let _ = std::fs::remove_file(&dest);
+        return Err("Source file changed on disk during save. Overlay was kept.".into());
+    }
+    Ok(())
 }
 
 /// Strip leading >/@ and trailing newlines from a header line.
@@ -821,6 +1964,13 @@ impl eframe::App for SeqFlashApp {
         // Apply a path picked by an async file-dialog worker, if it has landed.
         if let Some(path) = self.take_pending_open() {
             self.open_path(&path);
+        }
+
+        // Complete background overlay saves (progress + cancel).
+        self.poll_save_job();
+        // Keep animating the progress indicator while a save runs.
+        if self.save_job.is_some() {
+            ctx.request_repaint();
         }
 
         // Advance the FASTA record index for the active document a little

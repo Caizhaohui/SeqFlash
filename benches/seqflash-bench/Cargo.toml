@@ -1,0 +1,42 @@
+[package]
+name = "seqflash-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Criterion micro-benchmarks for SeqFlash (M8)"
+
+[lints]
+workspace = true
+
+[dependencies]
+seqflash-formats = { workspace = true }
+seqflash-index = { workspace = true }
+seqflash-search = { workspace = true }
+seqflash-viewer = { workspace = true }
+seqflash-ops = { workspace = true }
+seqflash-types = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parsing"
+harness = false
+path = "benches/parsing.rs"
+
+[[bench]]
+name = "indexing"
+harness = false
+path = "benches/indexing.rs"
+
+[[bench]]
+name = "searching"
+harness = false
+path = "benches/searching.rs"
+
+[[bench]]
+name = "rendering"
+harness = false
+path = "benches/rendering.rs"

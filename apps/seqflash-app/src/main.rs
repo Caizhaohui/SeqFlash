@@ -36,11 +36,12 @@ fn main() -> Result<()> {
     // subscriber so the writer is in place when the first log line fires.
     let log_dir = log_dir()?;
     let _guard = install_tracing(&log_dir)?;
+    install_panic_hook(log_dir.clone());
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         ?log_dir,
-        "SeqFlash starting (M1)"
+        "SeqFlash starting (M8)"
     );
 
     let settings = load_settings();
@@ -64,6 +65,38 @@ fn log_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create log directory: {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Install a panic hook that logs to the rolling file logger and stderr (M8).
+///
+/// The default Rust hook only prints to stderr, which is invisible in release
+/// GUI builds (`windows_subsystem = "windows"`). We also write a one-shot
+/// `crash-*.log` next to the daily logs for support.
+fn install_panic_hook(log_dir: PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map_or_else(|| "unknown".to_string(), |l| format!("{l}"));
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let message = format!("SeqFlash panic at {location}\n{payload}\n\nBacktrace:\n{backtrace}");
+        tracing::error!(%location, %payload, "panic");
+        // Best-effort crash file for release GUI (stderr may be discarded).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let crash_path = log_dir.join(format!("crash-{stamp}.log"));
+        let _ = std::fs::write(&crash_path, &message);
+        // Still invoke the default hook (prints to stderr in debug).
+        default_hook(info);
+    }));
 }
 
 /// Install the global tracing subscriber.

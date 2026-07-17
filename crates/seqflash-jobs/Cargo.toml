@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Background job management, progress, and cancellation (placeholder)"
+description = "Background job tokens: cancel, progress, and revision gating"
 
 [lints]
 workspace = true

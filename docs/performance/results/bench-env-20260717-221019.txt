@@ -1,0 +1,9 @@
+SeqFlash M8 micro-benchmark environment
+timestamp: 20260717-221019
+CPU: AMD Ryzen 7 2700X Eight-Core Processor         
+RAM_GiB: 31.9
+OS: Microsoft Windows 11 专业版
+rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+git: 1a48486
+profile: criterion (release-like)
+filter: (all)
