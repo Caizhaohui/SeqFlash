@@ -59,6 +59,9 @@ memchr = "2"
 # Native file dialogs
 rfd = "0.15"
 
+# Windows resource embedding (icon, version info)
+winres = "0.1"
+
 # Testing / benchmarks (M8)
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"

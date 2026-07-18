@@ -105,6 +105,8 @@ pub(crate) struct OverlayRecordPreview {
 #[allow(clippy::struct_excessive_bools)] // dialog visibility flags; kept explicit for UI wiring
 pub(crate) struct SeqFlashApp {
     settings: AppSettings,
+    /// Path where settings are persisted (so `record_recent` can auto-save).
+    settings_path: Option<PathBuf>,
     documents: DocumentList,
     active_document: Option<DocumentId>,
     recent_files: Vec<PathBuf>,
@@ -165,12 +167,19 @@ pub(crate) struct SeqFlashApp {
 impl SeqFlashApp {
     /// Construct the application from the already-loaded settings, optionally
     /// opening `initial_file` right away (e.g. from a command-line argument).
-    pub(crate) fn new(settings: AppSettings, initial_file: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        settings: AppSettings,
+        settings_path: Option<PathBuf>,
+        open_files: Vec<PathBuf>,
+    ) -> Self {
+        // Seed recent-files list from persisted settings.
+        let recent_files: Vec<PathBuf> = settings.recent_files.clone();
         let mut app = Self {
             settings,
             documents: DocumentList::new(),
             active_document: None,
-            recent_files: Vec::new(),
+            recent_files,
+            settings_path,
             notice: None,
             pending_open: Arc::new(Mutex::new(None)),
             viewers: HashMap::new(),
@@ -196,7 +205,7 @@ impl SeqFlashApp {
             insert_before: true,
             save_job: None,
         };
-        if let Some(path) = initial_file {
+        for path in open_files {
             app.open_path(&path);
         }
         app
@@ -867,6 +876,11 @@ impl SeqFlashApp {
         self.recent_files.retain(|p| p != &path);
         self.recent_files.insert(0, path);
         self.recent_files.truncate(RECENT_FILES_LIMIT);
+        self.settings.recent_files = self.recent_files.clone();
+        // Auto-save if the settings path is known.
+        if let Some(ref sp) = self.settings_path.clone() {
+            let _ = self.settings.save_to_path(sp);
+        }
     }
 
     pub(crate) fn export_current_record(

@@ -32,3 +32,6 @@ seqflash-search = { workspace = true }
 seqflash-types = { workspace = true }
 seqflash-viewer = { workspace = true }
 seqflash-settings = { workspace = true }
+
+[build-dependencies]
+winres = { workspace = true }

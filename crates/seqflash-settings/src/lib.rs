@@ -78,6 +78,9 @@ pub struct AppSettings {
     pub default_export_directory: Option<std::path::PathBuf>,
     #[serde(default)]
     pub reopen_previous_session: bool,
+    /// Recently opened file paths (persisted across sessions, max 10).
+    #[serde(default)]
+    pub recent_files: Vec<std::path::PathBuf>,
 }
 
 impl AppSettings {
@@ -161,6 +164,7 @@ impl Default for AppSettings {
             record_edit_limit_bytes: DEFAULT_RECORD_EDIT_LIMIT_BYTES,
             default_export_directory: None,
             reopen_previous_session: false,
+            recent_files: Vec::new(),
         }
     }
 }
